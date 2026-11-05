@@ -353,7 +353,9 @@ export async function init(app: TinyApp): Promise<void> {
       if (history.length > HISTORY_S) history.shift();
       latest = { down, up };
       await setTray();
-      app.window(POPOVER.id).push("stats", snapshot());
+      // a hidden webview is throttled, so a push per second would pile up behind it and
+      // delay the next open: send only while the popover is showing (opening sends a fresh one)
+      if (popoverOpen) app.window(POPOVER.id).push("stats", snapshot());
     } catch (err) {
       console.error("tor spike:", err);
     }
