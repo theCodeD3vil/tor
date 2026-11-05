@@ -1,0 +1,111 @@
+name: Release
+
+# A PR merged into main releases the "version" in tinyjs.json, unless that
+# version is already tagged — so bump it in the PR to ship a release.
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  version:
+    if: github.event.pull_request.merged
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      is-new: ${{ steps.version.outputs.is-new }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          sparse-checkout: tinyjs.json
+          sparse-checkout-cone-mode: false
+
+      - id: version
+        run: |
+          version=$(jq -r .version tinyjs.json)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if git ls-remote --exit-code --tags origin "refs/tags/v$version" > /dev/null; then
+            echo "::notice::v$version is already released. Bump \"version\" in tinyjs.json to publish a new release."
+            echo "is-new=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "is-new=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  release:
+    needs: version
+    if: needs.version.outputs.is-new == 'true'
+    runs-on: macos-15
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.0
+
+      - run: bun install --frozen-lockfile
+
+      - name: Install tinyjs
+        env:
+          TINYJS_VERSION: v0.70.3
+        run: |
+          curl -fsSL https://tinyjs.app/install | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH" # the installer's fallback link folder
+
+      # Shown on the release page and in the in-app update prompt
+      - name: Write release notes
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: printf '%s\n\n%s\n' "$PR_TITLE" "$PR_BODY" > "$RUNNER_TEMP/notes.md"
+
+      # One runner builds both CPUs. Each publish builds the app, its dmg and
+      # its zip, and merges the zip into one manifest.json. The frontend
+      # build (Vite) empties dist/ at the start of every publish, so each dmg
+      # moves out before the next one; publish keeps dist/publish safe itself.
+      # Apple's timestamp server, which codesign calls, drops the odd request,
+      # hence one retry per publish.
+      - name: Build and package
+        run: |
+          retry() { "$@" || "$@"; }
+          mkdir "$RUNNER_TEMP/dmg"
+          for arch in arm64 x86_64; do
+            retry tinyjs publish --arch "$arch" --dmg --notes-file "$RUNNER_TEMP/notes.md"
+            mv dist/*.dmg "$RUNNER_TEMP/dmg/"
+          done
+          # Installed apps only update from the manifest: both CPUs must be in it
+          jq -e '.mac.arm64 and .mac.x86_64' dist/publish/manifest.json > /dev/null
+          # tinyjs points the zips at update.url's folder (releases/latest);
+          # pin them to this release's tag instead
+          sed -i '' "s#/releases/latest/download/#/releases/download/v$VERSION/#" dist/publish/manifest.json
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MERGE_COMMIT: ${{ github.event.pull_request.merge_commit_sha }}
+        run: |
+          gh release create "v$VERSION" \
+            --target "$MERGE_COMMIT" \
+            --title "Tor $VERSION" \
+            --notes-file "$RUNNER_TEMP/notes.md" \
+            "$RUNNER_TEMP"/dmg/*.dmg dist/publish/*.zip dist/publish/manifest.json
+
+      # A dead link here is an updater failing silently on users' Macs
+      - name: Verify update links
+        run: |
+          curl -fsSL "https://github.com/$GITHUB_REPOSITORY/releases/latest/download/manifest.json" \
+            | jq -e --arg version "$VERSION" '.version == $version' > /dev/null
+          jq -r '.. | .url? // empty' dist/publish/manifest.json | sort -u | xargs -n 1 curl -fsSIL -o /dev/null
