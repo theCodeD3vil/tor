@@ -4,7 +4,7 @@
   "title": "Tor",
   "size": "960x640",
   "id": "com.michael.tor",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "backend": "backend/main.ts",
   "frontend": {
     "build": "bun run build",

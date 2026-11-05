@@ -5,7 +5,7 @@
 import type { Traffic } from "../shared/types";
 import type { MenubarIcon } from "../shared/settings";
 import { BOLD_GLYPHS, GLYPHS, UNITS_PER_EM, type PathCommand } from "./glyphs";
-import { LOGO_PATH, LOGO_VIEWBOX } from "./logo";
+import { LOGO_PATH, LOGO_VIEWBOX } from "../shared/logo";
 
 export type RGB = [number, number, number];
 

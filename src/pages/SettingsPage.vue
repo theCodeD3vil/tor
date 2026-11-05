@@ -10,6 +10,7 @@ import type {
   TopAppsCount,
   UpdateFrequency,
 } from "../../shared/settings";
+import MenubarIconPreview from "@/components/settings/MenubarIconPreview.vue";
 import ColorSelect from "@/components/settings/ColorSelect.vue";
 import SettingsField from "@/components/settings/SettingsField.vue";
 import SettingsSection from "@/components/settings/SettingsSection.vue";
@@ -169,12 +170,20 @@ const valueOptions: { value: MenubarValue; label: string }[] = [
       <SettingsField>
         <template #label>Icon</template>
         <Select v-model="menubarIcon">
-          <SelectTrigger size="sm" class="w-32">
-            <SelectValue />
+          <SelectTrigger size="sm" class="w-40">
+            <SelectValue>
+              <span class="flex items-center gap-2">
+                <MenubarIconPreview :icon="menubarIcon" />
+                {{ iconOptions.find((o) => o.value === menubarIcon)?.label }}
+              </span>
+            </SelectValue>
           </SelectTrigger>
           <SelectContent>
             <SelectItem v-for="o in iconOptions" :key="o.value" :value="o.value">
-              {{ o.label }}
+              <span class="flex items-center gap-2">
+                <MenubarIconPreview :icon="o.value" />
+                {{ o.label }}
+              </span>
             </SelectItem>
           </SelectContent>
         </Select>
