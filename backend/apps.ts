@@ -1,7 +1,7 @@
 // Per-app network usage since launch, grouped into real apps (.app bundles only).
-// Two staggered `nettop` streams (it only accepts whole-second intervals) give a
-// cumulative per-process reading every 500 ms; deltas between readings are
-// attributed to the app owning the pid. Icons come from NSWorkspace via JXA.
+// One `nettop` stream gives a cumulative per-process reading every second; deltas
+// between readings are attributed to the app owning the pid. Icons come from
+// NSWorkspace via JXA.
 
 import type {
   AppEntry,
@@ -14,22 +14,18 @@ import type {
 } from "../shared/types";
 
 // nettop block-buffers when stdout is a pipe, so it runs under a pty (`script`): each
-// reading arrives as soon as it is printed (CRLF line ends, handled in onLine)
+// reading arrives as soon as it is printed (CRLF line ends, handled in onLine).
+// nettop's stdin is closed (`<&-`): with stdin at EOF it busy-loops at 100%+ CPU, and
+// EOF is what it would get, since `script` forwards the app's /dev/null stdin into the
+// pty as ^D. A pipe held open would do too, but `script` refuses the socketpair that
+// tjs.spawn's `stdin: "pipe"` is, and macOS FIFOs are socket-backed as well.
 const STREAM_ARGS = [
   "script",
   "-q",
   "/dev/null",
-  "nettop",
-  "-P",
-  "-s",
-  "1",
-  "-L",
-  "0",
-  "-t",
-  "external",
-  "-J",
-  "bytes_in,bytes_out",
-  "-x",
+  "sh",
+  "-c",
+  "exec nettop -P -s 1 -L 0 -t external -J bytes_in,bytes_out -x <&-",
 ];
 const NAMES_REFRESH_MS = 2000;
 const ICON_PX = 64;
@@ -234,7 +230,7 @@ export async function createAppTracker(
   }
 
   async function runStream(): Promise<void> {
-    const proc = tjs.spawn(STREAM_ARGS, { stdout: "pipe", stderr: "ignore" });
+    const proc = tjs.spawn(STREAM_ARGS, { stdin: "ignore", stdout: "pipe", stderr: "ignore" });
     procs.push(proc);
     const reader = proc.stdout!.getReader();
     const decoder = new TextDecoder();
@@ -263,7 +259,6 @@ export async function createAppTracker(
   await refreshPids();
   setInterval(() => void refreshPids(), NAMES_REFRESH_MS);
   stream().catch((err) => console.error("tor apps stream:", err));
-  setTimeout(() => stream().catch((err) => console.error("tor apps stream:", err)), 500);
 
   return {
     top,
