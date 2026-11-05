@@ -43,6 +43,9 @@ onMounted(() => {
     instant.value = true;
     page.value = "home";
     await nextTick();
+    // every page's scroll goes back to the top while the popover is hidden, so the
+    // next open never shows it scrolling
+    for (const el of document.querySelectorAll<HTMLElement>(".page")) el.scrollTop = 0;
     instant.value = false;
   });
 });
