@@ -44,3 +44,23 @@ Tor keeps itself up to date: when it starts, and then daily, weekly or monthly a
 - **Only traffic that leaves your Mac is counted.** Connections between programs on your own Mac are ignored.
 - **History starts when you first open Tor.** Longer ranges fill up over time, up to 90 days.
 - **Totals and the app list only count while Tor is running.**
+
+## Screenshots
+
+<p align="center">
+  <img src="screenshots/live-panel.png" alt="Tor's panel: the current upload and download speed above a live chart of the last five minutes, today's downloaded and uploaded totals, and the start of the top apps list" width="320">
+  <br>
+  <em>Live speed, a five-minute chart and today's totals</em>
+</p>
+
+<p align="center">
+  <img src="screenshots/top-apps.png" alt="Tor's Top apps list with Today, 7d and 30d tabs, showing each app's icon and how much data it used" width="400">
+  <br>
+  <em>The apps using the most data, today, this week or this month</em>
+</p>
+
+<p align="center">
+  <img src="screenshots/stats.png" alt="Tor's Stats section: the app that used the most data, the downloaded and uploaded totals, the busiest day and the daily average" width="400">
+  <br>
+  <em>Your most data-hungry app, totals, busiest day and daily average</em>
+</p>
