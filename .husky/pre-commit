@@ -1,0 +1,2 @@
+bunx vp staged
+bunx vue-tsc --noEmit

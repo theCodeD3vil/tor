@@ -1,0 +1,20 @@
+{
+  "$schema": "https://tinyjs.app/schema/tinyjs.schema.json",
+  "name": "tor",
+  "title": "Tor",
+  "size": "960x640",
+  "id": "com.michael.tor",
+  "version": "0.0.1",
+  "backend": "backend/main.ts",
+  "frontend": {
+    "build": "bun run build",
+    "dist": "dist",
+    "dev": "bun run dev",
+    "devUrl": "http://127.0.0.1:5173"
+  },
+  "activation": "accessory",
+  "mainWindow": false,
+  "update": {
+    "url": "https://github.com/theCodeD3vil/tor/releases/latest/download/manifest.json"
+  }
+}

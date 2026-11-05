@@ -1,0 +1,19 @@
+{
+  "$schema": "https://raw.githubusercontent.com/fallow-rs/fallow/main/schema.json",
+  "entry": ["backend/main.ts"],
+  "ignorePatterns": [
+    ".build/**",
+    ".agents/**",
+    ".claude/**",
+    "src/components/ui/**",
+    "src/lib/utils.ts"
+  ],
+  "ignoreDependencies": [
+    "cn",
+    "class-variance-authority",
+    "reka-ui",
+    "@tailwindcss/vite",
+    "tjs:ffi",
+    "tjs:sqlite"
+  ]
+}
