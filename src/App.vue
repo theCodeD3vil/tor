@@ -47,6 +47,8 @@ onMounted(() => {
     // next open never shows it scrolling
     for (const el of document.querySelectorAll<HTMLElement>(".page")) el.scrollTop = 0;
     instant.value = false;
+    // tell the backend the page is up to date, so it can show the window
+    void window.tiny?.api.call("popoverReady");
   });
 });
 onUnmounted(() => {

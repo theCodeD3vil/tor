@@ -178,6 +178,10 @@ export const api: Record<string, TinyApiHandler> = {
   getVersion: async (_params, app) => (await app.info()).version,
   // the page (re)loaded and lost its icon cache: send every icon again once
   resetIcons: () => iconsSent.clear(),
+  // the page has applied what it was sent and rendered it (see togglePopover)
+  popoverReady: () => {
+    resolveReady?.();
+  },
   getApps: ({ period }: { period: Period }) => topApps(PERIODS.includes(period) ? period : "today"),
   getStats: ({ days }: { days: StatsRange }) =>
     statsPayload(STATS_RANGES.includes(days) ? days : 30),
@@ -239,6 +243,10 @@ function snapshot(): Snapshot {
 }
 
 let popoverOpen = false;
+let opening = false; // a click while the page is being prepared is ignored
+let resolveReady: (() => void) | undefined;
+// how long to wait for the page before showing the window anyway
+const READY_TIMEOUT_MS = 1500;
 let popoverFocused = false; // blur only counts after the window actually gained focus
 let closedAt = 0; // a click on the tray icon blurs (hides) the popover first
 
@@ -254,6 +262,16 @@ function hidePopover(app: TinyApp): void {
 async function togglePopover(app: TinyApp): Promise<void> {
   if (popoverOpen) return hidePopover(app);
   if (Date.now() - closedAt < 250) return; // that click is what just closed it
+  if (opening) return;
+  opening = true;
+  try {
+    await openPopover(app);
+  } finally {
+    opening = false;
+  }
+}
+
+async function openPopover(app: TinyApp): Promise<void> {
   const win = app.window(POPOVER.id);
   // Open on the display that was clicked. tray.position() reports one display's
   // icon only (the built-in one), so on another display fall back to the cursor.
@@ -275,9 +293,23 @@ async function togglePopover(app: TinyApp): Promise<void> {
   const x = Math.max(minX, Math.min(Math.round(centerX - POPOVER.width / 2), maxX));
   const y = rectOnScreen ? Math.round(rect.y + rect.height + 4) : screen.visible.y + 4;
   win.setPosition(x, y);
-  win.push("reset"); // safety net: the page should already be on home
+  // A hidden webview is throttled and can lag, so show it only once the page says it has
+  // applied the data and rendered it. "reset" goes last: the page answers when it is done.
+  const ready = new Promise<void>((resolve) => {
+    resolveReady = resolve;
+  });
   win.push("stats", snapshot());
   win.push("apps", topApps());
+  win.push("reset"); // also puts the page back on home, scrolled to the top
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([
+    ready,
+    new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, READY_TIMEOUT_MS);
+    }),
+  ]);
+  clearTimeout(timer);
+  resolveReady = undefined;
   popoverFocused = false;
   popoverOpen = true;
   win.show();
@@ -353,7 +385,9 @@ export async function init(app: TinyApp): Promise<void> {
       if (history.length > HISTORY_S) history.shift();
       latest = { down, up };
       await setTray();
-      app.window(POPOVER.id).push("stats", snapshot());
+      // a hidden webview is throttled, so a push per second would pile up behind it and
+      // delay the next open: send only while the popover is showing (opening sends a fresh one)
+      if (popoverOpen) app.window(POPOVER.id).push("stats", snapshot());
     } catch (err) {
       console.error("tor spike:", err);
     }
