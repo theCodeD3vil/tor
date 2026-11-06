@@ -13,7 +13,7 @@ import type {
 import { createAppTracker, type AppTracker } from "./apps";
 import { openUsageDb, type UsageDb } from "./db";
 import { colorHex, type MenubarValue, type SpeedUnit } from "../shared/settings";
-import { iconKey, renderIcon, type Colors, type IconOptions, type RGB, type Value } from "./icon";
+import { iconKey, type IconOptions, type Value } from "../shared/trayIcon";
 import { isOnline, watchNetwork, type NetworkWatcher } from "./network";
 import { getSettings, loadSettings, updateSettings } from "./settings";
 import {
@@ -78,12 +78,6 @@ const rateValue = (bytesPerSec: number, unit: SpeedUnit): Value =>
   scaled((unit === "Mbps" ? bytesPerSec * 8 : bytesPerSec) / 1000, RATE_UNITS[unit]);
 const totalValue = (bytes: number): Value => scaled(bytes / 1000, TOTAL_UNITS);
 
-const hexToRgb = (hex: string): RGB => [
-  parseInt(hex.slice(1, 3), 16),
-  parseInt(hex.slice(3, 5), 16),
-  parseInt(hex.slice(5, 7), 16),
-];
-
 // what the menubar icon shows right now, from the settings and the live numbers
 function trayOptions(): IconOptions {
   const settings = getSettings();
@@ -105,17 +99,13 @@ function trayOptions(): IconOptions {
     },
   };
   const { values, arrows, totals } = shown[settings.menubarValue];
-  const colors: Colors = {
-    down: hexToRgb(colorHex(settings.downloadColor)),
-    up: hexToRgb(colorHex(settings.uploadColor)),
-  };
   return {
     icon: settings.menubarIcon,
     bars: buckets(),
     values,
     arrows,
     units: totals ? TOTAL_UNITS : RATE_UNITS[settings.unit],
-    colors,
+    colors: { down: colorHex(settings.downloadColor), up: colorHex(settings.uploadColor) },
     offline: !online,
   };
 }
@@ -191,6 +181,10 @@ export const api: Record<string, TinyApiHandler> = {
   getApps: ({ period }: { period: Period }) => topApps(PERIODS.includes(period) ? period : "today"),
   getStats: ({ days }: { days: StatsRange }) =>
     statsPayload(STATS_RANGES.includes(days) ? days : 30),
+  // the page drew the menubar icon it was asked for (see setTray in init)
+  setTrayIcon: ({ png }: { png: string }) => trayIcons?.set(png),
+  // the page (re)loaded: it has drawn nothing yet, so ask it for the current icon
+  trayIconReady: () => trayIcons?.reset(),
 };
 
 const POPOVER = { id: "popover", width: 320, height: 580 };
@@ -200,6 +194,7 @@ const pushUpdateStatus = (app: TinyApp) => (status: UpdateStatus) =>
   app.window(POPOVER.id).push("update-status", status);
 
 let repaintTray: (() => Promise<void>) | undefined;
+let trayIcons: { set(png: string): Promise<void>; reset(): Promise<void> } | undefined;
 let flushUsageOnQuit: (() => void) | undefined;
 
 const localDay = (d: Date): string =>
@@ -362,20 +357,33 @@ export async function init(app: TinyApp): Promise<void> {
   await loadSettings(app);
   await loadUpdateState(app);
   let iconSeq = 0;
-  let shownIcon = ""; // iconKey of the icon in the menubar
-  const menu = [{ id: "quit", label: "Quit Tor" }];
+  let requestedIcon = ""; // iconKey of the icon last asked of the page
+  const tray = { primaryAction: true, menu: [{ id: "quit", label: "Quit Tor" }], tooltip: "Tor" };
+  app.tray.set({ ...tray, title: "Tor" }); // until the page has drawn the first icon
 
+  // The page draws the icon (src/lib/trayIcon.ts) and sends it back as a PNG.
   async function setTray() {
     const options = trayOptions();
     const key = iconKey(options);
-    if (key === shownIcon) return; // the same image is up already: no render, no file
-    shownIcon = key;
-    const path = `${dir}/icon-${iconSeq++ % 2}.png`; // alternate names: no icon caching
-    await tjs.writeFile(path, renderIcon(options));
-    app.tray.set({ icon: path, template: false, primaryAction: true, menu, tooltip: "Tor" });
+    if (key === requestedIcon) return; // that image is up, or on its way: nothing to draw
+    requestedIcon = key;
+    app.window(POPOVER.id).push("draw-tray-icon", options);
   }
+  trayIcons = {
+    async set(png) {
+      const path = `${dir}/icon-${iconSeq++ % 2}.png`; // alternate names: no icon caching
+      await tjs.writeFile(
+        path,
+        Uint8Array.from(atob(png), (c) => c.charCodeAt(0)),
+      );
+      app.tray.set({ ...tray, icon: path, template: false });
+    },
+    reset() {
+      requestedIcon = "";
+      return setTray();
+    },
+  };
   repaintTray = setTray;
-  await setTray();
 
   app.win.open(POPOVER.id, {
     page: "index.html",
