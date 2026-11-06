@@ -283,18 +283,30 @@ const MAX_BAR_H = HEIGHT - 2;
 const MIN_BAR_H = 3;
 const PEAK_FLOOR = 50_000_000; // bytes: below this a bucket never fills the bar
 
-function drawBars(c: Canvas, x: number, bars: Traffic[], colors: Colors): void {
+// the pixels a bar comes to: its height, the upload slice at the top, and whether it is lit
+interface BarShape {
+  h: number;
+  upH: number;
+  on: boolean;
+}
+
+function barShapes(bars: Traffic[]): BarShape[] {
   const peak = Math.max(...bars.map((b) => b.down + b.up), PEAK_FLOOR); // idle stays small
-  bars.forEach((bar, i) => {
+  return bars.map((bar) => {
     const total = bar.down + bar.up;
     const h = Math.max(MIN_BAR_H, Math.round(Math.sqrt(total / peak) * MAX_BAR_H));
-    const upH = total > 0 ? Math.round(h * (bar.up / total)) : 0;
+    return { h, upH: total > 0 ? Math.round(h * (bar.up / total)) : 0, on: total > 0 };
+  });
+}
+
+function drawBars(c: Canvas, x: number, shapes: BarShape[], colors: Colors): void {
+  shapes.forEach(({ h, upH, on }, i) => {
     const x0 = x + i * (BAR_W + BAR_GAP);
     const yTop = HEIGHT - h;
     const radius = Math.min(BAR_W / 2, h / 2); // pill-shaped ends
     const cx = x0 + BAR_W / 2;
     const cy = yTop + h / 2;
-    const alpha = total > 0 ? 1 : 0.35;
+    const alpha = on ? 1 : 0.35;
     for (let py = yTop - 1; py < HEIGHT; py++) {
       for (let px = x0 - 1; px < x0 + BAR_W + 1; px++) {
         // signed distance to the rounded rect → anti-aliased coverage
@@ -341,6 +353,30 @@ function drawArrow(c: Canvas, x0: number, dir: 1 | -1, color: RGB): void {
   }
 }
 
+// offline: the bars icon shows all five bars full and red; any other icon becomes a red
+// dot centered in the slot the icon had, so the text does not move, and sitting on the
+// bottom like the bars. The "none" icon gets a slot of its own for the dot.
+const OFFLINE_RED: RGB = [255, 59, 48]; // macOS system red
+const OFFLINE_COLORS: Colors = { down: OFFLINE_RED, up: OFFLINE_RED };
+const FULL_BARS: BarShape[] = Array.from({ length: BAR_COUNT }, () => ({
+  h: MAX_BAR_H,
+  upH: 0,
+  on: true,
+}));
+const DOT_SIZE = 20;
+
+function drawDot(c: Canvas, x: number, slotW: number): void {
+  const cx = x + slotW / 2;
+  const r = DOT_SIZE / 2;
+  const cy = HEIGHT - r;
+  for (let py = Math.floor(cy - r) - 1; py <= Math.ceil(cy + r); py++) {
+    for (let px = Math.floor(cx - r) - 1; px <= Math.ceil(cx + r); px++) {
+      const dist = Math.hypot(px + 0.5 - cx, py + 0.5 - cy) - r;
+      blend(c, px, py, OFFLINE_RED, Math.min(Math.max(0.5 - dist, 0), 1));
+    }
+  }
+}
+
 const LOGO_SIZE = 28;
 let logoRaster: Raster | undefined;
 
@@ -373,6 +409,8 @@ export interface IconOptions {
   /** every unit a value can take in the current mode (sizes the text slot) */
   units: string[];
   colors: Colors;
+  /** no network: a red dot takes the icon's place */
+  offline: boolean;
 }
 
 const SINGLE_PX = 26; // 13pt
@@ -380,12 +418,37 @@ const STACKED_PX = 20;
 const SINGLE_BASELINE = 34; // text sits at the bottom, its lowest ink (the slash) flush with the bars
 const STACKED_BASELINES = [16, 34];
 
+/** names the image renderIcon draws for these options: equal keys, identical PNG */
+export function iconKey({
+  icon,
+  bars,
+  values,
+  arrows,
+  units,
+  colors,
+  offline,
+}: IconOptions): string {
+  const shapes =
+    icon === "bars" && !offline
+      ? barShapes(bars).map((s) => `${s.h}/${s.upH}/${s.on ? 1 : 0}`)
+      : [];
+  return JSON.stringify([icon, shapes, values, arrows, units, colors, offline]);
+}
+
 /** the menubar icon as PNG bytes */
-export function renderIcon({ icon, bars, values, arrows, units, colors }: IconOptions): Uint8Array {
+export function renderIcon({
+  icon,
+  bars,
+  values,
+  arrows,
+  units,
+  colors,
+  offline,
+}: IconOptions): Uint8Array {
   const stacked = values.length > 1;
   const m = textMetrics(stacked ? STACKED_PX : SINGLE_PX);
 
-  const iconW =
+  const ownW =
     icon === "bars"
       ? BARS_W
       : icon === "arrows"
@@ -393,11 +456,14 @@ export function renderIcon({ icon, bars, values, arrows, units, colors }: IconOp
         : icon === "logo"
           ? LOGO_SIZE
           : 0;
+  const iconW = offline ? ownW || DOT_SIZE : ownW;
   const textX = PAD + (iconW ? iconW + ICON_GAP : 0);
   const width = textX + blockWidth(m, units) + PAD;
   const canvas: Canvas = { w: width, h: HEIGHT, data: new Uint8Array(width * HEIGHT * 4) };
 
-  if (icon === "bars") drawBars(canvas, PAD, bars, colors);
+  if (offline && icon === "bars") drawBars(canvas, PAD, FULL_BARS, OFFLINE_COLORS);
+  else if (offline) drawDot(canvas, PAD, iconW);
+  else if (icon === "bars") drawBars(canvas, PAD, barShapes(bars), colors);
   else if (icon === "arrows") {
     arrows.forEach((dir, i) => {
       drawArrow(

@@ -102,6 +102,10 @@ function dayKey(date: Date): string {
 export interface AppTracker {
   /** `period` may also be a count of days */
   top(n: number, period?: Period | number): TopApp[];
+  /** stop nettop (offline, asleep); the per-process baselines are kept, so the first
+   *  reading after resume() yields exactly the bytes moved in between */
+  pause(): void;
+  resume(): void;
   /** rows changed since the last call (absolute totals), or null; + the cutoff to prune */
   takeDirty(): { rows: UsageRow[]; pruneBefore: string } | null;
   /** the last `range` days: daily totals, overall totals, and the usual suspects */
@@ -112,10 +116,12 @@ export interface AppTracker {
 /**
  * @param tempDir scratch dir for icon PNGs
  * @param saved per-day, per-app totals from an earlier run (the 7d / 30d history)
+ * @param paused start without nettop (the Mac is offline); resume() starts it
  */
 export async function createAppTracker(
   tempDir: string,
   saved: DailyUsage = {},
+  { paused = false } = {},
 ): Promise<AppTracker> {
   const daily = saved;
   const touched = new Set<string>(); // "day|app" rows changed since the last save
@@ -127,7 +133,8 @@ export async function createAppTracker(
   const pending = new Map<string, { down: number; up: number }>(); // pid → bytes seen before its app was known
   const icons = new Map<string, string | null>(); // app name → data URL | null while loading
   const primeUntil = Date.now() + 1600; // readings before this only set baselines
-  const procs: ReturnType<typeof tjs.spawn>[] = [];
+  let proc: ReturnType<typeof tjs.spawn> | undefined; // the running nettop (via script)
+  let streamSeq = 0; // which stream() is current: an older one ending must not restart
   let refreshing: Promise<void> | null = null;
   let stopped = false;
 
@@ -219,29 +226,42 @@ export async function createAppTracker(
     if (app) add(app, down, up);
   }
 
-  async function stream(): Promise<void> {
-    try {
-      await runStream();
-    } finally {
-      // nettop ended unexpectedly (it was killed, or the pty closed): start it again
-      if (!stopped)
-        setTimeout(() => stream().catch((err) => console.error("tor apps stream:", err)), 1000);
-    }
+  function stream(): void {
+    if (stopped || paused) return;
+    const id = ++streamSeq;
+    runStream()
+      .catch((err) => console.error("tor apps stream:", err))
+      .finally(() => {
+        // nettop ended unexpectedly (it was killed, or the pty closed): start it again,
+        // unless this is a pause or a stop, or a newer stream has already replaced it
+        if (!stopped && !paused && id === streamSeq) setTimeout(stream, 1000);
+      });
   }
 
   async function runStream(): Promise<void> {
-    const proc = tjs.spawn(STREAM_ARGS, { stdin: "ignore", stdout: "pipe", stderr: "ignore" });
-    procs.push(proc);
-    const reader = proc.stdout!.getReader();
+    const p = tjs.spawn(STREAM_ARGS, { stdin: "ignore", stdout: "pipe", stderr: "ignore" });
+    proc = p;
+    const reader = p.stdout!.getReader();
     const decoder = new TextDecoder();
     let buf = "";
-    while (!stopped) {
+    for (;;) {
       const { value, done } = await reader.read();
       if (done) break;
       buf += decoder.decode(value, { stream: true });
       const lines = buf.split("\n");
       buf = lines.pop() ?? "";
       for (const line of lines) onLine(line);
+    }
+    if (proc === p) proc = undefined;
+  }
+
+  function killStream(): void {
+    const p = proc;
+    proc = undefined;
+    try {
+      p?.kill();
+    } catch {
+      // already exited
     }
   }
 
@@ -257,11 +277,24 @@ export async function createAppTracker(
   }
 
   await refreshPids();
-  setInterval(() => void refreshPids(), NAMES_REFRESH_MS);
-  stream().catch((err) => console.error("tor apps stream:", err));
+  setInterval(() => {
+    if (!paused) void refreshPids(); // names are only needed while nettop reports pids
+  }, NAMES_REFRESH_MS);
+  stream();
 
   return {
     top,
+    pause() {
+      if (paused) return;
+      paused = true;
+      killStream();
+    },
+    resume() {
+      if (!paused) return;
+      paused = false;
+      void refreshPids(); // processes started meanwhile
+      stream();
+    },
     takeDirty() {
       if (!touched.size) return null;
       const rows = [...touched].map((key): UsageRow => {
@@ -307,13 +340,7 @@ export async function createAppTracker(
     },
     stop() {
       stopped = true;
-      for (const p of procs) {
-        try {
-          p.kill();
-        } catch {
-          // already exited
-        }
-      }
+      killStream();
     },
   };
 }
