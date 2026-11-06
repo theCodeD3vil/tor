@@ -13,7 +13,8 @@ import type {
 import { createAppTracker, type AppTracker } from "./apps";
 import { openUsageDb, type UsageDb } from "./db";
 import { colorHex, type MenubarValue, type SpeedUnit } from "../shared/settings";
-import { renderIcon, type Colors, type IconOptions, type RGB, type Value } from "./icon";
+import { iconKey, renderIcon, type Colors, type IconOptions, type RGB, type Value } from "./icon";
+import { isOnline, watchNetwork, type NetworkWatcher } from "./network";
 import { getSettings, loadSettings, updateSettings } from "./settings";
 import {
   checkForUpdates,
@@ -24,6 +25,10 @@ import {
 } from "./updates";
 
 const INTERVAL_MS = 1000;
+const OFFLINE_INTERVAL_MS = 10_000; // offline, the counters are read now and then for the totals
+// an interface with no route still moves a few bytes a second (mDNS, neighbor discovery);
+// more than this in one offline interval is worth a look at the network state
+const OFFLINE_REFRESH_BYTES = 100_000;
 const BUCKETS = 5;
 const BUCKET_S = 360; // 5 × 6 min = 30 min
 const HISTORY_S = BUCKETS * BUCKET_S;
@@ -111,6 +116,7 @@ function trayOptions(): IconOptions {
     arrows,
     units: totals ? TOTAL_UNITS : RATE_UNITS[settings.unit],
     colors,
+    offline: !online,
   };
 }
 
@@ -234,6 +240,41 @@ function statsPayload(days: StatsRange): Stats {
 
 let latest: Traffic = { down: 0, up: 0 }; // bytes/s
 
+// Offline (no primary interface, see network.ts, or asleep), nettop is stopped and the
+// interface counters are read every OFFLINE_INTERVAL_MS instead of every second. Nothing
+// is lost: nettop keeps its per-process baselines, so its first reading after resume is
+// exactly the bytes moved in between, and the interface counters are cumulative. Real
+// traffic while "offline" makes the app re-read the state, in case a notice was missed.
+let online = true;
+let network: NetworkWatcher | undefined;
+let tickTimer: ReturnType<typeof setTimeout> | undefined;
+let ticking = false;
+let tick: () => Promise<void> = async () => {}; // set in init, once the counters are read
+
+function setOnline(next: boolean, why: string): void {
+  if (next === online) return;
+  online = next;
+  console.log(`tor: ${next ? "online" : "offline"} (${why})`);
+  if (next) {
+    appTracker?.resume();
+    scheduleTick(0); // catch up now rather than at the end of the offline interval
+  } else appTracker?.pause();
+  void repaintTray?.(); // the icon shows a red dot while offline
+}
+
+function scheduleTick(delayMs = online ? INTERVAL_MS : OFFLINE_INTERVAL_MS): void {
+  clearTimeout(tickTimer);
+  tickTimer = setTimeout(() => void tick(), delayMs);
+}
+
+// `history` holds one sample per second (buckets() counts on it), so a reading that
+// spans several seconds (the offline interval, a wake from sleep) is spread over them
+function record(down: number, up: number, secs: number, now: number): void {
+  const n = Math.min(Math.max(1, Math.round(secs)), HISTORY_S);
+  for (let i = n - 1; i >= 0; i--) history.push({ t: now - i * 1000, down: down / n, up: up / n });
+  if (history.length > HISTORY_S) history.splice(0, history.length - HISTORY_S);
+}
+
 function snapshot(): Snapshot {
   return {
     rate: latest,
@@ -321,11 +362,16 @@ export async function init(app: TinyApp): Promise<void> {
   await loadSettings(app);
   await loadUpdateState(app);
   let iconSeq = 0;
+  let shownIcon = ""; // iconKey of the icon in the menubar
   const menu = [{ id: "quit", label: "Quit Tor" }];
 
   async function setTray() {
+    const options = trayOptions();
+    const key = iconKey(options);
+    if (key === shownIcon) return; // the same image is up already: no render, no file
+    shownIcon = key;
     const path = `${dir}/icon-${iconSeq++ % 2}.png`; // alternate names: no icon caching
-    await tjs.writeFile(path, renderIcon(trayOptions()));
+    await tjs.writeFile(path, renderIcon(options));
     app.tray.set({ icon: path, template: false, primaryAction: true, menu, tooltip: "Tor" });
   }
   repaintTray = setTray;
@@ -353,7 +399,10 @@ export async function init(app: TinyApp): Promise<void> {
   const usageDb = openUsageDb(`${(await app.paths()).data}/usage.db`);
   await importLegacyUsage(app, usageDb);
   const keepFrom = new Date(Date.now() - 89 * 86_400_000);
-  appTracker = await createAppTracker(tempDir, usageDb.load(localDay(keepFrom)));
+  online = await isOnline().catch(() => true); // no answer: assume online and count
+  appTracker = await createAppTracker(tempDir, usageDb.load(localDay(keepFrom)), {
+    paused: !online,
+  });
   // persist per-day app totals (7d / 30d history) every 30 s when they changed
   const flushUsage = (): void => {
     const dirty = appTracker!.takeDirty();
@@ -371,32 +420,47 @@ export async function init(app: TinyApp): Promise<void> {
   let prev = await readCounters();
   let prevAt = Date.now();
 
-  setInterval(async () => {
+  tick = async () => {
+    if (ticking) return; // asked for while one runs: that one reschedules when it ends
+    ticking = true;
     try {
       const cur = await readCounters();
       const now = Date.now();
-      const secs = (now - prevAt) / 1000;
+      const secs = Math.max((now - prevAt) / 1000, 0.001);
       // counters can reset (sleep/reboot): clamp negative deltas to 0
-      const down = Math.max(0, cur.rx - prev.rx) / secs;
-      const up = Math.max(0, cur.tx - prev.tx) / secs;
+      const down = Math.max(0, cur.rx - prev.rx); // bytes since the previous reading
+      const up = Math.max(0, cur.tx - prev.tx);
       prev = cur;
       prevAt = now;
-      history.push({ t: now, down: down * secs, up: up * secs }); // bytes this tick
-      if (history.length > HISTORY_S) history.shift();
-      latest = { down, up };
+      record(down, up, secs, now);
+      latest = { down: down / secs, up: up / secs };
+      if (!online && down + up > OFFLINE_REFRESH_BYTES) void network?.refresh();
       await setTray();
       // a hidden webview is throttled, so a push per second would pile up behind it and
       // delay the next open: send only while the popover is showing (opening sends a fresh one)
       if (popoverOpen) app.window(POPOVER.id).push("stats", snapshot());
     } catch (err) {
       console.error("tor spike:", err);
+    } finally {
+      ticking = false;
+      scheduleTick();
     }
-  }, INTERVAL_MS);
+  };
+  scheduleTick();
+  network = watchNetwork((up) => setOnline(up, up ? "network up" : "network down"));
+}
+
+// Asleep nothing moves, so nettop stops. Awake, the state is read right away rather than
+// waited for: a wired interface can keep its keys through sleep and never notify.
+export function onSystem(kind: string): void {
+  if (kind === "sleep") setOnline(false, "sleep");
+  else if (kind === "wake") void network?.refresh();
 }
 
 function quitTor(app: TinyApp): void {
   flushUsageOnQuit?.();
   appTracker?.stop();
+  network?.stop();
   app.quit();
 }
 
