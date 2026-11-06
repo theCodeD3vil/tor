@@ -4,6 +4,7 @@ import { createApp } from "vue";
 import "./style.css";
 import App from "./App.vue";
 import { disableBrowserBehaviorInProduction } from "./lib/browser-behavior";
+import { startTrayIconRenderer } from "./lib/trayIcon";
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -12,4 +13,5 @@ const queryClient = new QueryClient({
 });
 
 disableBrowserBehaviorInProduction();
+startTrayIconRenderer();
 createApp(App).use(createPinia()).use(VueQueryPlugin, { queryClient }).mount("#app");
