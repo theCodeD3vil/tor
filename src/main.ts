@@ -3,6 +3,7 @@ import { createPinia } from "pinia";
 import { createApp } from "vue";
 import "./style.css";
 import App from "./App.vue";
+import { disableBrowserBehaviorInProduction } from "./lib/browser-behavior";
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -10,4 +11,5 @@ const queryClient = new QueryClient({
   },
 });
 
+disableBrowserBehaviorInProduction();
 createApp(App).use(createPinia()).use(VueQueryPlugin, { queryClient }).mount("#app");
