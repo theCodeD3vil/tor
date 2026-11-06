@@ -18,8 +18,8 @@ import {
 import { LOGO_PATH, LOGO_VIEWBOX } from "../../shared/logo";
 
 const FONT = '"Figtree Variable"';
-const DIGIT_WEIGHT = 600;
-const UNIT_WEIGHT = 800;
+const DIGIT_WEIGHT = 300; // light
+const UNIT_WEIGHT = 400; // normal
 const TEXT_COLOR = "#fff"; // text and logo: always white, whatever the menubar theme
 const OFFLINE_RED = "#ff3b30"; // macOS system red
 
