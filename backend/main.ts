@@ -8,6 +8,7 @@ import type {
   Stats,
   StatsRange,
   Traffic,
+  TopApp,
   UpdateStatus,
 } from "../shared/types";
 import { createAppTracker, type AppTracker } from "./apps";
@@ -179,6 +180,14 @@ export const api: Record<string, TinyApiHandler> = {
   installUpdate: (_params, app) =>
     installUpdate(app, (progress) => app.window(POPOVER.id).push("update-progress", progress)),
   getVersion: async (_params, app) => (await app.info()).version,
+  // the hidden apps with their icons, for the settings page
+  getIgnoredApps: (): TopApp[] =>
+    getSettings().ignoredApps.map((name) => ({
+      name,
+      down: 0,
+      up: 0,
+      icon: appTracker?.icon(name) ?? null,
+    })),
   // the page (re)loaded and lost its icon cache: send every icon again once
   resetIcons: () => iconsSent.clear(),
   // the page has applied what it was sent and rendered it (see togglePopover)
