@@ -37,8 +37,10 @@ interface Sample extends Traffic {
 }
 const history: Sample[] = []; // per-second { down, up } in bytes, newest last
 
+// -n: without it netstat reverse-resolves every interface address, which can take
+// many seconds (or 30 s) behind a VPN's DNS, and the tick waits on it
 async function readCounters(): Promise<{ rx: number; tx: number }> {
-  const proc = tjs.spawn(["netstat", "-ib"], { stdout: "pipe", stderr: "ignore" });
+  const proc = tjs.spawn(["netstat", "-ibn"], { stdout: "pipe", stderr: "ignore" });
   const text = await proc.stdout!.text();
   await proc.wait();
   let rx = 0;
