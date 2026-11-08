@@ -29,6 +29,7 @@ import { Button } from "@/components/ui/button";
 import { useUpdates } from "@/composables/useUpdates";
 import { useSettingsStore } from "@/stores/settings";
 
+const emit = defineEmits<{ openUpdate: [] }>();
 const store = useSettingsStore();
 const updates = useUpdates();
 const queryClient = useQueryClient();
@@ -269,13 +270,9 @@ const valueOptions: { value: MenubarValue; label: string }[] = [
 
       <SettingsField>
         <template #label>Check for updates</template>
-        <Button
-          v-if="updates.available.value"
-          size="sm"
-          :disabled="updates.isInstalling.value"
-          @click="updates.install()"
-        >
-          {{ updates.isInstalling.value ? "Installing…" : "Install and restart" }}
+        <!-- opens the update page (release notes), where the install button lives -->
+        <Button v-if="updates.available.value" size="sm" @click="emit('openUpdate')">
+          Download update
         </Button>
         <Button
           v-else

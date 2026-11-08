@@ -7,10 +7,13 @@ import { formatBytes } from "@/lib/format";
 const updates = useUpdates();
 const status = computed(() => updates.status.data.value);
 
-// null total = the server sent no size, so the bar can't show a fraction
+// null = the server sent no size, so the bar can't show a fraction; until the first
+// bytes arrive the bar is simply empty rather than indeterminate
 const percent = computed(() => {
   const p = updates.progress.value;
-  return p?.total ? Math.min(100, Math.round((p.received / p.total) * 100)) : null;
+  if (!p) return null;
+  if (p.total) return Math.min(100, Math.round((p.received / p.total) * 100));
+  return p.received === 0 ? 0 : null;
 });
 </script>
 
