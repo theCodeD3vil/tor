@@ -37,6 +37,8 @@ export interface Settings {
   /** look for updates on a schedule; off = only when asked */
   autoUpdates: boolean;
   updateFrequency: UpdateFrequency;
+  /** app names left out of Top apps and the totals (a VPN, a backup tool…); still recorded */
+  ignoredApps: string[];
 }
 
 export const defaultSettings: Settings = {
@@ -49,9 +51,11 @@ export const defaultSettings: Settings = {
   menubarValue: "download",
   autoUpdates: true,
   updateFrequency: "daily",
+  ignoredApps: [],
 };
 
-const allowed: { [K in keyof Settings]: readonly Settings[K][] } = {
+const MAX_IGNORED = 100;
+const allowed: { [K in Exclude<keyof Settings, "ignoredApps">]: readonly Settings[K][] } = {
   unit: ["MBps", "Mbps"],
   topApps: [5, 10, 20],
   theme: ["light", "dark", "system"],
@@ -67,9 +71,15 @@ const allowed: { [K in keyof Settings]: readonly Settings[K][] } = {
 export function pickSettings(input: unknown): Partial<Settings> {
   const picked: Record<string, unknown> = {};
   if (typeof input !== "object" || input === null) return picked as Partial<Settings>;
-  for (const key of Object.keys(allowed) as (keyof Settings)[]) {
+  for (const key of Object.keys(allowed) as (keyof typeof allowed)[]) {
     const value = (input as Record<string, unknown>)[key];
     if ((allowed[key] as readonly unknown[]).includes(value)) picked[key] = value;
+  }
+  const ignored = (input as Record<string, unknown>).ignoredApps;
+  if (Array.isArray(ignored)) {
+    picked.ignoredApps = [
+      ...new Set(ignored.filter((n): n is string => typeof n === "string" && n.length <= 200)),
+    ].slice(0, MAX_IGNORED);
   }
   return picked as Partial<Settings>;
 }

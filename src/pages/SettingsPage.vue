@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { IconDeviceDesktop, IconMoon, IconSun } from "@tabler/icons-vue";
+import { IconDeviceDesktop, IconMoon, IconSun, IconX } from "@tabler/icons-vue";
+import { useQueryClient } from "@tanstack/vue-query";
 import { computed } from "vue";
 import type {
   ColorId,
@@ -29,6 +30,14 @@ import { useSettingsStore } from "@/stores/settings";
 
 const store = useSettingsStore();
 const updates = useUpdates();
+const queryClient = useQueryClient();
+
+// an app shown again counts in the list and the totals at once
+const showApp = async (name: string): Promise<void> => {
+  await store.unignoreApp(name);
+  await queryClient.invalidateQueries({ queryKey: ["top-apps"] });
+  await queryClient.invalidateQueries({ queryKey: ["stats"] });
+};
 
 // the button doubles as the status: what the last check found
 const checkLabel = computed(() => {
@@ -202,6 +211,32 @@ const valueOptions: { value: MenubarValue; label: string }[] = [
           </SelectContent>
         </Select>
       </SettingsField>
+    </SettingsSection>
+
+    <SettingsSection>
+      <template #section-title>Ignored apps</template>
+
+      <p v-if="!store.settings.ignoredApps.length" class="px-4 py-3 text-xs text-muted-foreground">
+        No hidden apps
+      </p>
+      <ul v-else class="flex flex-wrap gap-1.5 px-4 py-3">
+        <li
+          v-for="name in store.settings.ignoredApps"
+          :key="name"
+          class="flex items-center gap-1 rounded-full bg-foreground/[0.07] py-0.5 pr-1 pl-2.5 text-xs"
+        >
+          <span class="max-w-40 truncate">{{ name }}</span>
+          <button
+            type="button"
+            class="rounded-full p-0.5 text-muted-foreground hover:text-foreground"
+            :aria-label="`Show ${name} again`"
+            :title="`Show ${name} again`"
+            @click="showApp(name)"
+          >
+            <IconX class="size-3" />
+          </button>
+        </li>
+      </ul>
     </SettingsSection>
 
     <SettingsSection>

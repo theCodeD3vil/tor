@@ -12,7 +12,7 @@ import {
 defineProps<{ label: string }>();
 const model = defineModel<ColorId>({ required: true });
 const selected = computed(
-  () => COLOR_PRESETS.find((c) => c.id === model.value) ?? COLOR_PRESETS[0],
+  () => COLOR_PRESETS.find((color) => color.id === model.value) ?? COLOR_PRESETS[0],
 );
 </script>
 

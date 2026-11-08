@@ -19,14 +19,28 @@ import type {
 // EOF is what it would get, since `script` forwards the app's /dev/null stdin into the
 // pty as ^D. A pipe held open would do too, but `script` refuses the socketpair that
 // tjs.spawn's `stdin: "pipe"` is, and macOS FIFOs are socket-backed as well.
+// Interface types are listed instead of `-t external`: VPN tunnels (utun, type
+// "undefined") don't count as external, so with a VPN up every app's traffic vanished
+// and only the VPN daemon's did show. Loopback and AWDL stay out.
+// Socket mode (no -P): each process row is followed by its sockets with their
+// interface, which is what tells a VPN's carrier socket apart (see endSample).
 const STREAM_ARGS = [
   "script",
   "-q",
   "/dev/null",
   "sh",
   "-c",
-  "exec nettop -P -s 1 -L 0 -t external -J bytes_in,bytes_out -x <&-",
+  "exec nettop -n -s 1 -L 0 -t wifi -t wired -t expensive -t undefined -J interface,bytes_in,bytes_out -x <&-",
 ];
+// A VPN's carrier: the UDP socket on a real interface that moves the (encrypted) bytes
+// the apps move on utun. Spotted by a well-known tunnel port, or by carrying about as
+// much as all utun sockets together while the tunnel is busy; its bytes are taken off
+// its process so that traffic is not counted twice. The tunnel must move at least
+// CARRIER_MIN_BYTES in a sample before the size match applies, so that idle noise
+// cannot mark a random UDP socket.
+const TUNNEL_PORTS = new Set([51820, 1194, 1195, 1197, 1198, 500, 4500, 1701]);
+const CARRIER_MIN_BYTES = 4096;
+const CARRIER_MATCH = { low: 0.4, high: 1.6 };
 const NAMES_REFRESH_MS = 2000;
 const ICON_PX = 64;
 
@@ -70,6 +84,21 @@ async function run(args: string[]): Promise<string> {
   return text;
 }
 
+// one process row of a nettop reading, with the sockets listed under it
+interface ProcSample {
+  pid: string;
+  in: number;
+  out: number;
+  sockets: {
+    key: string;
+    iface: string;
+    udp: boolean;
+    remotePort: number;
+    in: number;
+    out: number;
+  }[];
+}
+
 // Outermost .app of an executable path — null for daemons, CLIs and system internals
 interface AppRef {
   name: string;
@@ -78,6 +107,11 @@ interface AppRef {
 
 function appOf(path: string): AppRef | null {
   if (path.startsWith("/System/Library/")) return null;
+  // Network Extensions (VPN tunnel providers, content filters) carry other apps'
+  // traffic: counting them would count those bytes twice
+  if (path.startsWith("/Library/SystemExtensions/") || /\.(appex|systemextension)\//.test(path)) {
+    return null;
+  }
   const m = path.match(/^(.*?\/([^/]+)\.app)(?:\/|$)/);
   return m ? { name: m[2], bundle: m[1] } : null;
 }
@@ -117,11 +151,15 @@ export interface AppTracker {
  * @param tempDir scratch dir for icon PNGs
  * @param saved per-day, per-app totals from an earlier run (the 7d / 30d history)
  * @param paused start without nettop (the Mac is offline); resume() starts it
+ * @param isIgnored apps the user hid: still recorded, left out of top() and stats()
  */
 export async function createAppTracker(
   tempDir: string,
   saved: DailyUsage = {},
-  { paused = false } = {},
+  {
+    paused = false,
+    isIgnored = (_name: string): boolean => false,
+  }: { paused?: boolean; isIgnored?: (name: string) => boolean } = {},
 ): Promise<AppTracker> {
   const daily = saved;
   const touched = new Set<string>(); // "day|app" rows changed since the last save
@@ -130,6 +168,8 @@ export async function createAppTracker(
   await tjs.writeFile(iconScript, ICON_SCRIPT);
   const pids = new Map<string, AppRef | null>(); // pid → { name, bundle } | null (not an app)
   const last = new Map<string, { in: number; out: number }>(); // pid → { in, out } cumulative at the previous reading
+  const lastSock = new Map<string, { in: number; out: number }>(); // "pid|socket" → cumulative at the previous reading
+  let sample: ProcSample[] = []; // the reading being read (nettop prints one per second)
   const pending = new Map<string, { down: number; up: number }>(); // pid → bytes seen before its app was known
   const icons = new Map<string, string | null>(); // app name → data URL | null while loading
   const primeUntil = Date.now() + 1600; // readings before this only set baselines
@@ -191,6 +231,7 @@ export async function createAppTracker(
     for (let i = 0; i < days; i++) {
       const day = daily[dayKey(new Date(Date.now() - i * 86_400_000))];
       for (const [name, v] of Object.entries(day ?? {})) {
+        if (isIgnored(name)) continue;
         const t = totals.get(name) ?? { down: 0, up: 0, bundle: v.bundle };
         t.down += v.down;
         t.up += v.up;
@@ -200,30 +241,102 @@ export async function createAppTracker(
     return totals;
   }
 
-  function onLine(line: string): void {
-    const [label, bytesIn, bytesOut] = line.replace(/\r$/, "").split(",");
-    const dot = label ? label.lastIndexOf(".") : -1;
-    if (dot < 0 || bytesOut === undefined) return; // header or blank
-    const pid = label.slice(dot + 1);
-    if (!/^\d+$/.test(pid)) return;
-    const cur = { in: Number(bytesIn) || 0, out: Number(bytesOut) || 0 };
-    const prev = last.get(pid);
-    last.set(pid, cur);
-    // a pid first seen after priming is a new process: all its bytes are new
-    const base = prev ?? (Date.now() < primeUntil ? cur : { in: 0, out: 0 });
-    const down = Math.max(0, cur.in - base.in);
-    const up = Math.max(0, cur.out - base.out);
-    if (!down && !up) return;
-    if (!pids.has(pid)) {
-      const p = pending.get(pid) ?? { down: 0, up: 0 };
-      p.down += down;
-      p.up += up;
-      pending.set(pid, p);
-      void refreshPids();
+  // a nettop reading: header, then per process its row followed by its sockets
+  //   ,interface,bytes_in,bytes_out,
+  //   Safari.512,,123,45,
+  //   tcp4 10.0.0.2:5000<->1.2.3.4:443,en0,100,40,
+  function onLine(raw: string): void {
+    const line = raw.replace(/\r$/, "");
+    const [label, iface, bytesIn, bytesOut] = line.split(",");
+    if (bytesOut === undefined) return; // blank
+    if (label === "") {
+      endSample(); // header: the previous reading is complete
       return;
     }
-    const app = pids.get(pid);
-    if (app) add(app, down, up);
+    const cur = { in: Number(bytesIn) || 0, out: Number(bytesOut) || 0 };
+    const arrow = label.indexOf("<->");
+    if (arrow < 0) {
+      const dot = label.lastIndexOf(".");
+      const pid = label.slice(dot + 1);
+      if (dot < 0 || !/^\d+$/.test(pid)) return;
+      sample.push({ pid, ...cur, sockets: [] });
+      return;
+    }
+    const proc = sample[sample.length - 1];
+    if (!proc) return; // a socket before any process row: cannot happen, ignore
+    const remotePort = Number(label.slice(arrow + 3).match(/[.:](\d+)$/)?.[1]);
+    proc.sockets.push({
+      key: label,
+      iface,
+      udp: label.startsWith("udp"),
+      remotePort: Number.isFinite(remotePort) ? remotePort : 0,
+      ...cur,
+    });
+  }
+
+  function endSample(): void {
+    const procs = sample;
+    sample = [];
+    if (!procs.length) return;
+    const priming = Date.now() < primeUntil;
+    const delta = (
+      map: Map<string, { in: number; out: number }>,
+      key: string,
+      cur: { in: number; out: number },
+    ): { down: number; up: number } => {
+      const prev = map.get(key);
+      map.set(key, cur);
+      // first seen after priming: a new process/socket, all its bytes are new
+      const base = prev ?? (priming ? cur : { in: 0, out: 0 });
+      return { down: Math.max(0, cur.in - base.in), up: Math.max(0, cur.out - base.out) };
+    };
+    // pass 1: socket deltas; what the tunnels moved, and the UDP sockets that might carry it
+    const seen = new Set<string>();
+    let tunnel = 0;
+    const udp: { proc: ProcSample; down: number; up: number; port: number }[] = [];
+    const perProc = new Map<ProcSample, { down: number; up: number }>();
+    for (const proc of procs) {
+      perProc.set(proc, delta(last, proc.pid, proc));
+      for (const sock of proc.sockets) {
+        const key = `${proc.pid}|${sock.key}`;
+        seen.add(key);
+        const d = delta(lastSock, key, sock);
+        if (!d.down && !d.up) continue;
+        if (sock.iface.startsWith("utun")) tunnel += d.down + d.up;
+        else if (sock.udp && sock.iface && !sock.iface.startsWith("lo")) {
+          udp.push({ proc, ...d, port: sock.remotePort });
+        }
+      }
+    }
+    for (const key of lastSock.keys()) if (!seen.has(key)) lastSock.delete(key); // closed
+    // pass 2: take the carriers' bytes off their processes
+    if (tunnel > 0) {
+      for (const c of udp) {
+        const total = c.down + c.up;
+        const sized =
+          tunnel >= CARRIER_MIN_BYTES &&
+          total >= tunnel * CARRIER_MATCH.low &&
+          total <= tunnel * CARRIER_MATCH.high;
+        if (!TUNNEL_PORTS.has(c.port) && !sized) continue;
+        const d = perProc.get(c.proc)!;
+        d.down = Math.max(0, d.down - c.down);
+        d.up = Math.max(0, d.up - c.up);
+      }
+    }
+    // pass 3: attribute to apps
+    for (const [proc, d] of perProc) {
+      if (!d.down && !d.up) continue;
+      if (!pids.has(proc.pid)) {
+        const p = pending.get(proc.pid) ?? { down: 0, up: 0 };
+        p.down += d.down;
+        p.up += d.up;
+        pending.set(proc.pid, p);
+        void refreshPids();
+        continue;
+      }
+      const app = pids.get(proc.pid);
+      if (app) add(app, d.down, d.up);
+    }
   }
 
   function stream(): void {
@@ -313,7 +426,8 @@ export async function createAppTracker(
         const day = dayKey(new Date(Date.now() - i * 86_400_000));
         let down = 0;
         let up = 0;
-        for (const v of Object.values(daily[day] ?? {})) {
+        for (const [name, v] of Object.entries(daily[day] ?? {})) {
+          if (isIgnored(name)) continue;
           down += v.down;
           up += v.up;
         }
