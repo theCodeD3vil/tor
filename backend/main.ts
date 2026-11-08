@@ -165,6 +165,11 @@ export const api: Record<string, TinyApiHandler> = {
   updateSettings: async (changes: unknown, app) => {
     const next = await updateSettings(changes, app);
     void repaintTray?.(); // unit, colors and the menubar options all change the icon
+    // hiding or showing an app changes the list and the totals at once
+    if (popoverOpen && appTracker) {
+      app.window(POPOVER.id).push("apps", topApps());
+      app.window(POPOVER.id).push("stats", snapshot());
+    }
     return next;
   },
   getUpdateStatus: () => getUpdateStatus(),
@@ -187,7 +192,7 @@ export const api: Record<string, TinyApiHandler> = {
   trayIconReady: () => trayIcons?.reset(),
 };
 
-const POPOVER = { id: "popover", width: 320, height: 580 };
+const POPOVER = { id: "popover", width: 380, height: 800 };
 let appTracker: AppTracker | undefined;
 // tell the popover when a background check changes the update status
 const pushUpdateStatus = (app: TinyApp) => (status: UpdateStatus) =>
@@ -410,6 +415,7 @@ export async function init(app: TinyApp): Promise<void> {
   online = await isOnline().catch(() => true); // no answer: assume online and count
   appTracker = await createAppTracker(tempDir, usageDb.load(localDay(keepFrom)), {
     paused: !online,
+    isIgnored: (name) => getSettings().ignoredApps.includes(name),
   });
   // persist per-day app totals (7d / 30d history) every 30 s when they changed
   const flushUsage = (): void => {

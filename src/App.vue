@@ -4,11 +4,13 @@ import {
   IconArrowBigDownFilled,
   IconArrowBigUpFilled,
   IconFlame,
+  IconEyeOff,
   IconArrowLeft,
   IconDownload,
   IconInfoCircle,
   IconSettings,
 } from "@tabler/icons-vue";
+import { useQueryClient } from "@tanstack/vue-query";
 import { computed, nextTick, onMounted, onUnmounted, ref } from "vue";
 import type { Period, StatsRange } from "../shared/types";
 import { Button } from "@/components/ui/button";
@@ -102,6 +104,13 @@ const statsRangeLabel = computed(() =>
   statsDays.value === 7 ? "7 days ago" : `${statsDays.value} days ago`,
 );
 const topUsage = computed(() => Math.max(1, ...apps.value.map((a) => a.down + a.up)));
+const queryClient = useQueryClient();
+// hide an app from the list and the totals; the cached lists and stats are stale at once
+const hideApp = async (name: string): Promise<void> => {
+  await settingsStore.ignoreApp(name);
+  await queryClient.invalidateQueries({ queryKey: ["top-apps"] });
+  await queryClient.invalidateQueries({ queryKey: ["stats"] });
+};
 const quit = () => window.tiny?.api.call("quit");
 
 // click outside → close; only after the panel really had focus (it can blur while opening)
@@ -274,7 +283,11 @@ onUnmounted(() => {
                 {{ traffic.period === "today" ? "Collecting usage…" : "No usage recorded yet" }}
               </p>
               <TransitionGroup v-else tag="ul" name="app" class="relative flex flex-col gap-3.5">
-                <li v-for="app in apps" :key="app.name" class="app-row flex items-center gap-2.5">
+                <li
+                  v-for="app in apps"
+                  :key="app.name"
+                  class="app-row group flex items-center gap-2.5"
+                >
                   <img
                     v-if="app.icon"
                     :src="app.icon"
@@ -291,7 +304,18 @@ onUnmounted(() => {
                   <div class="flex min-w-0 flex-1 flex-col gap-1">
                     <div class="flex items-baseline justify-between gap-2 text-xs">
                       <span class="min-w-0 truncate font-medium">{{ app.name }}</span>
-                      <span class="shrink-0 text-muted-foreground tabular-nums">
+                      <span
+                        class="flex shrink-0 items-center gap-1 text-muted-foreground tabular-nums"
+                      >
+                        <button
+                          type="button"
+                          class="rounded p-0.5 opacity-0 transition-opacity hover:text-foreground focus-visible:opacity-100 group-hover:opacity-100"
+                          :aria-label="`Hide ${app.name}`"
+                          :title="`Hide ${app.name} from Top apps and totals`"
+                          @click="hideApp(app.name)"
+                        >
+                          <IconEyeOff class="size-3.5" />
+                        </button>
                         {{ formatBytes(app.down + app.up) }}
                       </span>
                     </div>
@@ -508,6 +532,9 @@ onUnmounted(() => {
 html,
 body {
   background: transparent !important;
+  /* WKWebView bounces the root even when it can't scroll, dragging the whole panel off
+     the window and baring the vibrancy underneath */
+  overscroll-behavior: none;
 }
 
 .no-scrollbar {

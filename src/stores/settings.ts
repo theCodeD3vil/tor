@@ -8,9 +8,18 @@ export const useSettingsStore = defineStore("settings", () => {
   const settings = ref<Settings>({ ...defaultSettings });
   const version = ref("");
 
-  function update(changes: Partial<Settings>): void {
+  function update(changes: Partial<Settings>): Promise<unknown> {
     settings.value = { ...settings.value, ...changes };
-    void window.tiny?.api.call("updateSettings", changes);
+    return window.tiny?.api.call("updateSettings", changes) ?? Promise.resolve();
+  }
+
+  // hide an app from Top apps and the totals (it keeps being recorded), or show it again
+  function ignoreApp(name: string): Promise<unknown> {
+    if (settings.value.ignoredApps.includes(name)) return Promise.resolve();
+    return update({ ignoredApps: [...settings.value.ignoredApps, name] });
+  }
+  function unignoreApp(name: string): Promise<unknown> {
+    return update({ ignoredApps: settings.value.ignoredApps.filter((n) => n !== name) });
   }
 
   async function load(): Promise<void> {
@@ -27,5 +36,5 @@ export const useSettingsStore = defineStore("settings", () => {
     void load();
   }
 
-  return { settings, version, update, listen };
+  return { settings, version, update, ignoreApp, unignoreApp, listen };
 });
