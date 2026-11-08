@@ -462,6 +462,7 @@ onUnmounted(() => {
           v-else-if="page === 'settings'"
           key="settings"
           class="page no-scrollbar absolute inset-0 mx-4 overflow-y-auto rounded-2xl"
+          @open-update="go('update')"
         />
         <AboutPage
           v-else-if="page === 'about'"
