@@ -144,6 +144,8 @@ export interface AppTracker {
   takeDirty(): { rows: UsageRow[]; pruneBefore: string } | null;
   /** the last `range` days: daily totals, overall totals, and the usual suspects */
   stats(range?: number): Stats;
+  /** an app's icon (data URL) when known; starts loading it from its bundle otherwise */
+  icon(name: string): string | null;
   stop(): void;
 }
 
@@ -451,6 +453,18 @@ export async function createAppTracker(
         // average over the days that actually recorded traffic
         avgPerDay: withData.length ? (totals.down + totals.up) / withData.length : 0,
       };
+    },
+    icon(name) {
+      const known = icons.get(name);
+      if (known) return known;
+      for (const day of Object.values(daily)) {
+        const bundle = day[name]?.bundle;
+        if (bundle) {
+          loadIcon({ name, bundle });
+          break;
+        }
+      }
+      return icons.get(name) ?? null;
     },
     stop() {
       stopped = true;

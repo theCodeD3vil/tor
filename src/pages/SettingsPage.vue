@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { IconDeviceDesktop, IconMoon, IconSun, IconX } from "@tabler/icons-vue";
-import { useQueryClient } from "@tanstack/vue-query";
+import { useQuery, useQueryClient } from "@tanstack/vue-query";
+import type { TopApp } from "../../shared/types";
 import { computed } from "vue";
 import type {
   ColorId,
@@ -31,6 +32,15 @@ import { useSettingsStore } from "@/stores/settings";
 const store = useSettingsStore();
 const updates = useUpdates();
 const queryClient = useQueryClient();
+
+// the hidden apps with their icons; refetched when the list changes
+const ignored = useQuery({
+  queryKey: computed(() => ["ignored-apps", store.settings.ignoredApps.join("|")]),
+  queryFn: async () => (await window.tiny.api.call("getIgnoredApps")) as TopApp[],
+  staleTime: 1_000,
+  // icons load in the background: ask again while any is missing
+  refetchInterval: (query) => (query.state.data?.some((a) => !a.icon) ? 1_000 : false),
+});
 
 // an app shown again counts in the list and the totals at once
 const showApp = async (name: string): Promise<void> => {
@@ -219,24 +229,39 @@ const valueOptions: { value: MenubarValue; label: string }[] = [
       <p v-if="!store.settings.ignoredApps.length" class="px-4 py-3 text-xs text-muted-foreground">
         No hidden apps
       </p>
-      <ul v-else class="flex flex-wrap gap-1.5 px-4 py-3">
-        <li
-          v-for="name in store.settings.ignoredApps"
-          :key="name"
-          class="flex items-center gap-1 rounded-full bg-foreground/[0.07] py-0.5 pr-1 pl-2.5 text-xs"
+      <!-- one row per hidden app, divided like the settings fields -->
+      <div
+        v-for="app in ignored.data.value ?? []"
+        v-else
+        :key="app.name"
+        class="flex items-center gap-2.5 px-4 py-2.5"
+      >
+        <img
+          v-if="app.icon"
+          :src="app.icon"
+          alt=""
+          class="size-7 shrink-0 rounded-md"
+          draggable="false"
+        />
+        <div
+          v-else
+          class="flex size-7 shrink-0 items-center justify-center rounded-md bg-foreground/10 text-xs font-semibold"
         >
-          <span class="max-w-40 truncate">{{ name }}</span>
-          <button
-            type="button"
-            class="rounded-full p-0.5 text-muted-foreground hover:text-foreground"
-            :aria-label="`Show ${name} again`"
-            :title="`Show ${name} again`"
-            @click="showApp(name)"
-          >
-            <IconX class="size-3" />
-          </button>
-        </li>
-      </ul>
+          {{ app.name.slice(0, 1) }}
+        </div>
+        <span class="min-w-0 flex-1 truncate text-sm font-medium text-foreground/90">
+          {{ app.name }}
+        </span>
+        <Button
+          variant="ghost"
+          size="icon-sm"
+          :aria-label="`Show ${app.name} again`"
+          :title="`Show ${app.name} again`"
+          @click="showApp(app.name)"
+        >
+          <IconX class="size-4" />
+        </Button>
+      </div>
     </SettingsSection>
 
     <SettingsSection>

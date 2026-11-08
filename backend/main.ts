@@ -8,6 +8,7 @@ import type {
   Stats,
   StatsRange,
   Traffic,
+  TopApp,
   UpdateStatus,
 } from "../shared/types";
 import { createAppTracker, type AppTracker } from "./apps";
@@ -37,8 +38,10 @@ interface Sample extends Traffic {
 }
 const history: Sample[] = []; // per-second { down, up } in bytes, newest last
 
+// -n: without it netstat reverse-resolves every interface address, which can take
+// many seconds (or 30 s) behind a VPN's DNS, and the tick waits on it
 async function readCounters(): Promise<{ rx: number; tx: number }> {
-  const proc = tjs.spawn(["netstat", "-ib"], { stdout: "pipe", stderr: "ignore" });
+  const proc = tjs.spawn(["netstat", "-ibn"], { stdout: "pipe", stderr: "ignore" });
   const text = await proc.stdout!.text();
   await proc.wait();
   let rx = 0;
@@ -177,6 +180,14 @@ export const api: Record<string, TinyApiHandler> = {
   installUpdate: (_params, app) =>
     installUpdate(app, (progress) => app.window(POPOVER.id).push("update-progress", progress)),
   getVersion: async (_params, app) => (await app.info()).version,
+  // the hidden apps with their icons, for the settings page
+  getIgnoredApps: (): TopApp[] =>
+    getSettings().ignoredApps.map((name) => ({
+      name,
+      down: 0,
+      up: 0,
+      icon: appTracker?.icon(name) ?? null,
+    })),
   // the page (re)loaded and lost its icon cache: send every icon again once
   resetIcons: () => iconsSent.clear(),
   // the page has applied what it was sent and rendered it (see togglePopover)
