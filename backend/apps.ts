@@ -62,8 +62,10 @@ function run(argv) {
 `;
 
 // macOS "responsible process": the app a process works on behalf of, e.g. the
-// terminal behind a shell, `claude` or `curl` (even through tmux), or Safari behind
-// its WebKit helpers. Private libSystem call, so fall back to the executable path.
+// terminal behind a shell, `claude` or `curl`, or Safari behind its WebKit helpers.
+// Private libSystem call, so fall back to the executable path. It does not reach
+// into a detached session: its server is launched by launchd and is responsible for
+// itself and for everything inside (see SESSION_HOSTS).
 let responsiblePid: ((pid: number) => number) | null = null;
 try {
   const { dlopen } = await import("tjs:ffi");
@@ -80,6 +82,66 @@ async function run(args: string[]): Promise<string> {
   const text = await proc.stdout!.text();
   await proc.wait();
   return text;
+}
+
+// "" when the command is missing or fails (no tmux, or no server running)
+async function tryRun(args: string[]): Promise<string> {
+  try {
+    return await run(args);
+  } catch {
+    return "";
+  }
+}
+
+// Detached session hosts: a server that outlives the terminal and is reparented to
+// launchd (tmux, screen, zellij, dtach, abduco, ...), so the responsible-process
+// lookup stops at it and everything inside is unattributed. The terminal is only
+// reachable through the client: an ordinary child of the terminal's shell running the
+// same program, whose responsible process is the terminal app. The server's subtree
+// is attributed to its newest client, matched by a shared argument (a socket path or
+// session name) when the server has several; tmux knows its sessions, so its panes
+// are mapped to the client attached to their own session. Adding a host: its
+// executable name below, and a precise mapping if the generic one is too coarse.
+const SESSION_HOSTS = new Set(["tmux", "screen", "zellij", "dtach", "abduco"]);
+
+interface SessionHosts {
+  tmux: {
+    panes: Map<string, string>; // pane_pid → session id
+    clients: Map<string, { pid: string; activity: number }>; // session id → newest client
+  };
+  args: Map<string, string[]>; // pid → argv (without argv[0]) of the host processes
+}
+
+function hostName(path: string): string | null {
+  const name = path.slice(path.lastIndexOf("/") + 1).toLowerCase();
+  return SESSION_HOSTS.has(name) ? name : null;
+}
+
+async function readSessionHosts(paths: Map<string, string>): Promise<SessionHosts> {
+  const hosts: SessionHosts = { tmux: { panes: new Map(), clients: new Map() }, args: new Map() };
+  const hostPids = [...paths].filter(([, path]) => hostName(path)).map(([pid]) => pid);
+  if (!hostPids.length) return hosts;
+  const [argsOut, paneOut, clientOut] = await Promise.all([
+    tryRun(["ps", "-o", "pid=,args=", "-p", hostPids.join(",")]),
+    tryRun(["tmux", "list-panes", "-a", "-F", "#{pane_pid} #{session_id}"]),
+    tryRun(["tmux", "list-clients", "-F", "#{client_pid} #{session_id} #{client_activity}"]),
+  ]);
+  for (const line of argsOut.split("\n")) {
+    const m = line.match(/^\s*(\d+)\s+(.*)$/);
+    if (m) hosts.args.set(m[1], m[2].split(/\s+/).slice(1).filter(Boolean));
+  }
+  for (const line of paneOut.split("\n")) {
+    const [pid, session] = line.trim().split(" ");
+    if (pid && session) hosts.tmux.panes.set(pid, session);
+  }
+  for (const line of clientOut.split("\n")) {
+    const [pid, session, activity] = line.trim().split(" ");
+    if (!pid || !session) continue;
+    const at = Number(activity) || 0;
+    const cur = hosts.tmux.clients.get(session);
+    if (!cur || at >= cur.activity) hosts.tmux.clients.set(session, { pid, activity: at });
+  }
+  return hosts;
 }
 
 // one process row of a nettop reading, with the sockets listed under it
@@ -184,6 +246,7 @@ export async function createAppTracker(
   const iconScript = `${iconDir}/icon.jxa.js`;
   await tjs.writeFile(iconScript, ICON_SCRIPT);
   const pids = new Map<string, AppRef | null>(); // pid → { name, bundle } | null (not an app)
+  const sessionApp = new Map<string, AppRef>(); // session host key → the terminal last attached to it
   const last = new Map<string, { in: number; out: number }>(); // pid → { in, out } cumulative at the previous reading
   const lastSock = new Map<string, { in: number; out: number }>(); // "pid|socket" → cumulative at the previous reading
   let sample: ProcSample[] = []; // the reading being read (nettop prints one per second)
@@ -198,15 +261,62 @@ export async function createAppTracker(
   function refreshPids(): Promise<void> {
     refreshing ??= (async () => {
       const paths = new Map<string, string>();
-      for (const line of (await run(["ps", "-axo", "pid=,comm="])).split("\n")) {
-        const m = line.match(/^\s*(\d+)\s+(.+)$/);
-        if (m) paths.set(m[1], m[2]);
+      const parent = new Map<string, string>();
+      for (const line of (await run(["ps", "-axo", "pid=,ppid=,comm="])).split("\n")) {
+        const m = line.match(/^\s*(\d+)\s+(\d+)\s+(.+)$/);
+        if (!m) continue;
+        paths.set(m[1], m[3]);
+        parent.set(m[1], m[2]);
       }
-      const next = new Map<string, AppRef | null>();
-      for (const [pid, path] of paths) {
+      const hosts = await readSessionHosts(paths);
+      const direct = (pid: string): AppRef | null => {
+        const path = paths.get(pid);
+        if (!path) return null;
         const owner = responsiblePid?.(Number(pid)) ?? 0;
         const ownerPath = owner > 0 ? paths.get(String(owner)) : undefined;
-        next.set(pid, (ownerPath && appOf(ownerPath)) || appOf(path));
+        return (ownerPath && appOf(ownerPath)) || appOf(path);
+      };
+      // the terminal behind a session: its client's app now, else the one last seen,
+      // so a detached session keeps counting where it was shown
+      const remember = (key: string, app: AppRef | null): AppRef | null => {
+        if (app) sessionApp.set(key, app);
+        return app ?? sessionApp.get(key) ?? null;
+      };
+      const tmuxSession = (session: string): AppRef | null => {
+        const client = hosts.tmux.clients.get(session);
+        return remember(`tmux:${session}`, client ? direct(client.pid) : null);
+      };
+      // a host server's client: same program under a terminal, sharing an argument
+      // (socket path, session name) with the server when any client does
+      const hostClient = (server: string, name: string): AppRef | null => {
+        const serverArgs = new Set(hosts.args.get(server) ?? []);
+        let best: { pid: number; shared: boolean; app: AppRef } | null = null;
+        for (const [pid, path] of paths) {
+          if (pid === server || hostName(path) !== name) continue;
+          const app = direct(pid);
+          if (!app) continue;
+          const shared = (hosts.args.get(pid) ?? []).some((arg) => serverArgs.has(arg));
+          const n = Number(pid);
+          if (!best || (shared && !best.shared) || (shared === best.shared && n > best.pid)) {
+            best = { pid: n, shared, app };
+          }
+        }
+        return remember(`${name}:${server}`, best?.app ?? null);
+      };
+      // a process inside a session: walk up to the pane (tmux) or to the host server
+      const sessionHostApp = (pid: string): AppRef | null => {
+        for (let p: string | undefined = pid, hops = 0; p && p !== "1" && hops < 64; hops++) {
+          const session = hosts.tmux.panes.get(p);
+          if (session) return tmuxSession(session);
+          const name = hostName(paths.get(p) ?? "");
+          if (name && parent.get(p) === "1") return hostClient(p, name);
+          p = parent.get(p);
+        }
+        return null;
+      };
+      const next = new Map<string, AppRef | null>();
+      for (const pid of paths.keys()) {
+        next.set(pid, direct(pid) ?? sessionHostApp(pid));
       }
       pids.clear();
       for (const [pid, app] of next) pids.set(pid, app);
