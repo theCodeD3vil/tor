@@ -66,13 +66,11 @@ function run(argv) {
 // its WebKit helpers. Private libSystem call, so fall back to the executable path.
 let responsiblePid: ((pid: number) => number) | null = null;
 try {
-  const { CFunction, Lib, types } = await import("tjs:ffi");
-  const fn = new CFunction(
-    new Lib(Lib.LIBC_NAME).symbol("responsibility_get_pid_responsible_for_pid"),
-    types.sint,
-    [types.sint],
-  );
-  responsiblePid = (pid) => fn.call(pid) as number;
+  const { dlopen } = await import("tjs:ffi");
+  const { symbols } = dlopen("c", {
+    responsibility_get_pid_responsible_for_pid: { args: ["i32"], returns: "i32" },
+  });
+  responsiblePid = (pid) => symbols.responsibility_get_pid_responsible_for_pid(pid);
 } catch (err) {
   console.error("tor apps: responsible-pid lookup unavailable:", err);
 }
@@ -105,7 +103,24 @@ interface AppRef {
   bundle: string;
 }
 
+// Processes that move bytes for an app without living in its bundle: system daemons
+// that download for the App Store, and Steam, whose /Applications/Steam.app is only a
+// bootstrapper for a client installed under Application Support (no ".app/" in its
+// path, and its helpers sit in a nested "Steam Helper.app").
+const HOME = tjs.homeDir;
+const APP_STORE: AppRef = { name: "App Store", bundle: "/System/Applications/App Store.app" };
+const STEAM: AppRef = { name: "Steam", bundle: "/Applications/Steam.app" };
+const APP_ALIASES: { prefix: string; app: AppRef }[] = [
+  { prefix: "/System/Library/PrivateFrameworks/AppStoreDaemon.framework/", app: APP_STORE },
+  { prefix: "/System/Library/PrivateFrameworks/CommerceKit.framework/", app: APP_STORE },
+  { prefix: "/System/Applications/App Store.app/", app: APP_STORE },
+  { prefix: `${HOME}/Library/Application Support/Steam/`, app: STEAM },
+];
+
 function appOf(path: string): AppRef | null {
+  for (const { prefix, app } of APP_ALIASES) {
+    if (path.startsWith(prefix)) return app;
+  }
   if (path.startsWith("/System/Library/")) return null;
   // Network Extensions (VPN tunnel providers, content filters) carry other apps'
   // traffic: counting them would count those bytes twice
