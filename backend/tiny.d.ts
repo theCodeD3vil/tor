@@ -320,7 +320,7 @@ declare interface TinyAppInfo {
   version: string;
   /** the tinyjs version the app was built with ('dev' from a checkout) */
   tinyjs: string;
-  /** e.g. 'txiki.js 26.6.0' */
+  /** e.g. 'txiki.js 26.11.0' */
   runtime: string;
 }
 
@@ -885,6 +885,16 @@ declare interface Tiny {
    *  Not on Windows: there's no tiny-media:// handler in WebView2, so the URL
    *  loads nothing — check tiny.system.capabilities().proxyURL !== false. */
   proxyURL(url: string): string;
+
+  /** A URL to use as an iframe's src for a video player that needs a Referer.
+   *  A direct YouTube iframe in an app page fails (Error 153 on macOS and Linux, a
+   *  browser error page on Windows), because file:// pages send no Referer. This serves
+   *  a small page on 127.0.0.1 that frames the target, so the player gets one:
+   *    iframe.src = await tiny.embedURL('https://www.youtube.com/embed/ID');
+   *  Rejects unless the URL is https on www.youtube.com, www.youtube-nocookie.com,
+   *  player.vimeo.com or a host in tinyjs.json's "embedHosts". The URL only
+   *  works for this run of the app, so ask each launch rather than saving it. */
+  embedURL(url: string): Promise<string>;
 
   /** A correct file:// URL for a disk path on every platform — use for
    *  <audio>/<img>/<video> src of backend-provided paths. Hand-rolled
@@ -1727,6 +1737,8 @@ declare interface TinyApp {
    *  (reading app.paths.data as an object still works but is deprecated) */
   paths: (() => Promise<TinyPaths>) & TinyPathsDeprecatedFields;
   shell: TinyShell;
+  /** see tiny.embedURL — resolves the same way, synchronously */
+  embedURL(url: string): string;
   launchAtLogin: TinyLaunchAtLogin;
   /** '' clears the badge */
   badge(text: string): boolean;
