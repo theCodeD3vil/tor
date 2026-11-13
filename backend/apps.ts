@@ -42,6 +42,9 @@ const TUNNEL_PORTS = new Set([51820, 1194, 1195, 1197, 1198, 500, 4500, 1701]);
 const CARRIER_MIN_BYTES = 4096;
 const CARRIER_MATCH = { low: 0.4, high: 1.6 };
 const NAMES_REFRESH_MS = 2000;
+// nettop reports a process for a few more readings after it exits (its last bytes among
+// them), so a pid that left `ps` keeps its app this long
+const GONE_KEEP_MS = 15_000;
 const ICON_PX = 64;
 
 // JXA: render an app's NSWorkspace icon to a PNG (args: bundle path, out path, px)
@@ -169,6 +172,12 @@ interface AppRef {
 // that download for the App Store, and Steam, whose /Applications/Steam.app is only a
 // bootstrapper for a client installed under Application Support (no ".app/" in its
 // path, and its helpers sit in a nested "Steam Helper.app").
+// Terminals with a server (Rex, Herdr) are the other kind: the window is one app, the
+// shells run under a server bundle launched by launchd ("Rex Server.app", "Herdr
+// Core.app", or a bare herdr-core binary), which is their responsible process, so
+// all the traffic of what runs inside would be filed under the server, or dropped
+// when its path has no .app in it. Those servers are looked up by the bundle id of
+// the window app they belong to (see resolveAliases), so moving the app is fine.
 const HOME = tjs.homeDir;
 const APP_STORE: AppRef = { name: "App Store", bundle: "/System/Applications/App Store.app" };
 const STEAM: AppRef = { name: "Steam", bundle: "/Applications/Steam.app" };
@@ -178,6 +187,43 @@ const APP_ALIASES: { prefix: string; app: AppRef }[] = [
   { prefix: "/System/Applications/App Store.app/", app: APP_STORE },
   { prefix: `${HOME}/Library/Application Support/Steam/`, app: STEAM },
 ];
+// server paths → the bundle id of the terminal app that shows them
+const SERVER_ALIASES: { prefixes: string[]; bundleId: string }[] = [
+  {
+    prefixes: [`${HOME}/Library/Application Support/com.superlogical.rex/`],
+    bundleId: "com.superlogical.rex", // Rex (Beta): "Rex Server.app" under Application Support
+  },
+  {
+    prefixes: [`${HOME}/.local/share/herdr-core/`, `${HOME}/.local/bin/herdr-core`],
+    bundleId: "dev.herdr.app", // Herdr: "Herdr Core.app" (or a bare herdr-core) under ~/.local
+  },
+];
+
+// JXA: where NSWorkspace finds the app with each bundle id (one path per line, "" if none)
+const APP_PATHS_SCRIPT = `ObjC.import("AppKit");
+function run(argv) {
+  return argv.map((id) => {
+    const url = $.NSWorkspace.sharedWorkspace.URLForApplicationWithBundleIdentifier(id);
+    return url.isNil() ? "" : url.path.js;
+  }).join("\\n");
+}
+`;
+
+// Add an alias per installed terminal app for the server paths that run on its behalf.
+// Apps not installed are skipped: their servers cannot be running either.
+async function resolveAliases(dir: string): Promise<void> {
+  const script = `${dir}/apppaths.jxa.js`;
+  await tjs.writeFile(script, APP_PATHS_SCRIPT);
+  const ids = SERVER_ALIASES.map((a) => a.bundleId);
+  const out = await tryRun(["osascript", "-l", "JavaScript", script, ...ids]);
+  const lines = out.replace(/\n$/, "").split("\n");
+  SERVER_ALIASES.forEach(({ prefixes }, i) => {
+    const bundle = lines[i];
+    const name = bundle?.match(/([^/]+)\.app$/)?.[1];
+    if (!bundle || !name) return;
+    for (const prefix of prefixes) APP_ALIASES.push({ prefix, app: { name, bundle } });
+  });
+}
 
 function appOf(path: string): AppRef | null {
   for (const { prefix, app } of APP_ALIASES) {
@@ -217,12 +263,19 @@ export interface AppTracker {
    *  reading after resume() yields exactly the bytes moved in between */
   pause(): void;
   resume(): void;
-  /** rows changed since the last call (absolute totals), or null; + the cutoff to prune */
-  takeDirty(): { rows: UsageRow[]; pruneBefore: string } | null;
+  /** rows changed since the last call (absolute totals), or null; + the cutoff to prune
+   *  and the rows merged away (see mergeSaved) */
+  takeDirty(): {
+    rows: UsageRow[];
+    pruneBefore: string;
+    remove: { day: string; app: string }[];
+  } | null;
   /** the last `range` days: daily totals, overall totals, and the usual suspects */
   stats(range?: number): Stats;
   /** an app's icon (data URL) when known; starts loading it from its bundle otherwise */
   icon(name: string): string | null;
+  /** forget the cached sums (the hidden apps changed) */
+  invalidate(): void;
   stop(): void;
 }
 
@@ -242,10 +295,28 @@ export async function createAppTracker(
 ): Promise<AppTracker> {
   const daily = saved;
   const touched = new Set<string>(); // "day|app" rows changed since the last save
+  const removed: { day: string; app: string }[] = []; // rows merged into another app since the last save
   const iconDir = await tjs.makeTempDir(`${tempDir}/tor-appicons-XXXXXX`);
   const iconScript = `${iconDir}/icon.jxa.js`;
   await tjs.writeFile(iconScript, ICON_SCRIPT);
+  await resolveAliases(iconDir);
+  // History recorded under a server's own name before its alias existed ("Herdr Core",
+  // "Rex Server") is folded into the app it stands for, so the list shows one entry
+  for (const [day, apps] of Object.entries(daily)) {
+    for (const [name, v] of Object.entries(apps)) {
+      const app = v.bundle ? appOf(v.bundle) : null;
+      if (!app || app.name === name) continue;
+      const into = (apps[app.name] ??= { down: 0, up: 0, bundle: app.bundle });
+      into.down += v.down;
+      into.up += v.up;
+      into.bundle = app.bundle;
+      delete apps[name];
+      touched.add(`${day}|${app.name}`);
+      removed.push({ day, app: name });
+    }
+  }
   const pids = new Map<string, AppRef | null>(); // pid → { name, bundle } | null (not an app)
+  const gone = new Map<string, number>(); // pid → when it was last missing from ps
   const sessionApp = new Map<string, AppRef>(); // session host key → the terminal last attached to it
   const last = new Map<string, { in: number; out: number }>(); // pid → { in, out } cumulative at the previous reading
   const lastSock = new Map<string, { in: number; out: number }>(); // "pid|socket" → cumulative at the previous reading
@@ -318,6 +389,17 @@ export async function createAppTracker(
       for (const pid of paths.keys()) {
         next.set(pid, direct(pid) ?? sessionHostApp(pid));
       }
+      // just exited: keep the app for the readings nettop still prints for it
+      const now = Date.now();
+      for (const [pid, app] of pids) {
+        if (paths.has(pid)) continue;
+        const since = gone.get(pid) ?? now;
+        if (now - since < GONE_KEEP_MS) {
+          gone.set(pid, since);
+          next.set(pid, app);
+        }
+      }
+      for (const pid of gone.keys()) if (!next.has(pid) || paths.has(pid)) gone.delete(pid);
       pids.clear();
       for (const [pid, app] of next) pids.set(pid, app);
       for (const [pid, bytes] of pending) {
@@ -343,17 +425,40 @@ export async function createAppTracker(
       .catch(() => icons.delete(app.name)); // retried the next time the app shows traffic
   }
 
+  // Sums are read far more often than written (the tray repaints every second, the
+  // popover polls twice a second), so each is computed once and kept until the next
+  // add(), the day rolls over, or the hidden apps change (invalidate()).
+  const sums = new Map<string, unknown>();
+  let sumsDay = "";
+  function cached<T>(key: string, compute: () => T): T {
+    const today = dayKey(new Date());
+    if (today !== sumsDay) {
+      sums.clear();
+      sumsDay = today;
+    }
+    if (sums.has(key)) return sums.get(key) as T;
+    const value = compute();
+    sums.set(key, value);
+    return value;
+  }
+
   function add(app: AppRef, down: number, up: number): void {
-    const today = (daily[dayKey(new Date())] ??= {});
+    const day = dayKey(new Date());
+    const today = (daily[day] ??= {});
     const entry = (today[app.name] ??= { down: 0, up: 0, bundle: app.bundle });
     entry.down += down;
     entry.up += up;
-    touched.add(`${dayKey(new Date())}|${app.name}`);
+    touched.add(`${day}|${app.name}`);
+    sums.clear();
     loadIcon(app);
   }
 
-  // sum of the last `days` calendar days, today included
+  // sum of the last `days` calendar days, today included (shared: do not mutate)
   function history(days: number): Map<string, AppEntry> {
+    return cached(`history:${days}`, () => sumHistory(days));
+  }
+
+  function sumHistory(days: number): Map<string, AppEntry> {
     const totals = new Map<string, AppEntry>();
     for (let i = 0; i < days; i++) {
       const day = daily[dayKey(new Date(Date.now() - i * 86_400_000))];
@@ -536,7 +641,7 @@ export async function createAppTracker(
       stream();
     },
     takeDirty() {
-      if (!touched.size) return null;
+      if (!touched.size && !removed.length) return null;
       const rows = [...touched].map((key): UsageRow => {
         const [day, app] = key.split("|");
         const v = daily[day][app];
@@ -545,20 +650,25 @@ export async function createAppTracker(
       touched.clear();
       const pruneBefore = dayKey(new Date(Date.now() - (KEEP_DAYS - 1) * 86_400_000));
       for (const day of Object.keys(daily)) if (day < pruneBefore) delete daily[day];
-      return { rows, pruneBefore };
+      const remove = removed.splice(0);
+      return { rows, pruneBefore, remove };
     },
     stats(range = 30) {
       const days: DayUsage[] = [];
       for (let i = range - 1; i >= 0; i--) {
         const day = dayKey(new Date(Date.now() - i * 86_400_000));
-        let down = 0;
-        let up = 0;
-        for (const [name, v] of Object.entries(daily[day] ?? {})) {
-          if (isIgnored(name)) continue;
-          down += v.down;
-          up += v.up;
-        }
-        days.push({ day, down, up });
+        days.push(
+          cached(`day:${day}`, () => {
+            let down = 0;
+            let up = 0;
+            for (const [name, v] of Object.entries(daily[day] ?? {})) {
+              if (isIgnored(name)) continue;
+              down += v.down;
+              up += v.up;
+            }
+            return { day, down, up };
+          }),
+        );
       }
       const totals = days.reduce((t, d) => ({ down: t.down + d.down, up: t.up + d.up }), {
         down: 0,
@@ -590,6 +700,9 @@ export async function createAppTracker(
         }
       }
       return icons.get(name) ?? null;
+    },
+    invalidate() {
+      sums.clear();
     },
     stop() {
       stopped = true;

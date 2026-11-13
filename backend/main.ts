@@ -167,6 +167,7 @@ export const api: Record<string, TinyApiHandler> = {
   getSettings: () => getSettings(),
   updateSettings: async (changes: unknown, app) => {
     const next = await updateSettings(changes, app);
+    appTracker?.invalidate(); // the hidden apps may have changed, and the sums leave them out
     void repaintTray?.(); // unit, colors and the menubar options all change the icon
     // hiding or showing an app changes the list and the totals at once
     if (popoverOpen && appTracker) {
@@ -431,7 +432,7 @@ export async function init(app: TinyApp): Promise<void> {
   // persist per-day app totals (7d / 30d history) every 30 s when they changed
   const flushUsage = (): void => {
     const dirty = appTracker!.takeDirty();
-    if (dirty) usageDb.save(dirty.rows, dirty.pruneBefore);
+    if (dirty) usageDb.save(dirty.rows, dirty.pruneBefore, dirty.remove);
   };
   setInterval(flushUsage, 30_000);
   flushUsageOnQuit = flushUsage;
