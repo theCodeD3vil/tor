@@ -1,7 +1,8 @@
 // Per-app network usage since launch, grouped into real apps (.app bundles only).
 // One `nettop` stream gives a cumulative per-process reading every second; deltas
 // between readings are attributed to the app owning the pid. Icons come from
-// NSWorkspace via JXA.
+// NSWorkspace via JXA, rendered once to PNG files that the page loads by path
+// (tiny.fileURL), so neither side holds them as base64 strings.
 
 import type {
   AppEntry,
@@ -239,14 +240,6 @@ function appOf(path: string): AppRef | null {
   return m ? { name: m[2], bundle: m[1] } : null;
 }
 
-function toBase64(bytes: Uint8Array): string {
-  let bin = "";
-  for (let i = 0; i < bytes.length; i += 0x8000) {
-    bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
-  }
-  return btoa(bin);
-}
-
 const PERIOD_DAYS: Record<Period, number> = { today: 1, "7d": 7, "30d": 30 };
 const KEEP_DAYS = 90;
 
@@ -272,7 +265,7 @@ export interface AppTracker {
   } | null;
   /** the last `range` days: daily totals, overall totals, and the usual suspects */
   stats(range?: number): Stats;
-  /** an app's icon (data URL) when known; starts loading it from its bundle otherwise */
+  /** an app's icon (PNG path) when known; starts rendering it from its bundle otherwise */
   icon(name: string): string | null;
   /** forget the cached sums (the hidden apps changed) */
   invalidate(): void;
@@ -280,8 +273,9 @@ export interface AppTracker {
 }
 
 /**
- * @param tempDir scratch dir for icon PNGs
+ * @param tempDir scratch dir for the JXA scripts
  * @param saved per-day, per-app totals from an earlier run (the 7d / 30d history)
+ * @param iconDir where icon PNGs are kept, across launches (under readAccess, see tinyjs.json)
  * @param paused start without nettop (the Mac is offline); resume() starts it
  * @param isIgnored apps the user hid: still recorded, left out of top() and stats()
  */
@@ -291,15 +285,17 @@ export async function createAppTracker(
   {
     paused = false,
     isIgnored = (_name: string): boolean => false,
-  }: { paused?: boolean; isIgnored?: (name: string) => boolean } = {},
+    iconDir,
+  }: { paused?: boolean; isIgnored?: (name: string) => boolean; iconDir: string },
 ): Promise<AppTracker> {
   const daily = saved;
   const touched = new Set<string>(); // "day|app" rows changed since the last save
   const removed: { day: string; app: string }[] = []; // rows merged into another app since the last save
-  const iconDir = await tjs.makeTempDir(`${tempDir}/tor-appicons-XXXXXX`);
-  const iconScript = `${iconDir}/icon.jxa.js`;
+  const scriptDir = await tjs.makeTempDir(`${tempDir}/tor-apps-XXXXXX`);
+  const iconScript = `${scriptDir}/icon.jxa.js`;
   await tjs.writeFile(iconScript, ICON_SCRIPT);
-  await resolveAliases(iconDir);
+  await tjs.makeDir(iconDir, { recursive: true });
+  await resolveAliases(scriptDir);
   // History recorded under a server's own name before its alias existed ("Herdr Core",
   // "Rex Server") is folded into the app it stands for, so the list shows one entry
   for (const [day, apps] of Object.entries(daily)) {
@@ -322,7 +318,7 @@ export async function createAppTracker(
   const lastSock = new Map<string, { in: number; out: number }>(); // "pid|socket" → cumulative at the previous reading
   let sample: ProcSample[] = []; // the reading being read (nettop prints one per second)
   const pending = new Map<string, { down: number; up: number }>(); // pid → bytes seen before its app was known
-  const icons = new Map<string, string | null>(); // app name → data URL | null while loading
+  const icons = new Map<string, string | null>(); // app name → PNG path | null while rendering
   const primeUntil = Date.now() + 1600; // readings before this only set baselines
   let proc: ReturnType<typeof tjs.spawn> | undefined; // the running nettop (via script)
   let streamSeq = 0; // which stream() is current: an older one ending must not restart
@@ -415,13 +411,17 @@ export async function createAppTracker(
     return refreshing;
   }
 
+  // rendered once per app; a PNG left by an earlier launch is used as is
   function loadIcon(app: AppRef): void {
     if (icons.has(app.name)) return;
     icons.set(app.name, null);
     const out = `${iconDir}/${app.name.replace(/[^\w-]+/g, "_")}.png`;
-    run(["osascript", "-l", "JavaScript", iconScript, app.bundle, out, String(ICON_PX)])
-      .then(() => tjs.readFile(out))
-      .then((bytes) => icons.set(app.name, `data:image/png;base64,${toBase64(bytes)}`))
+    tjs
+      .stat(out)
+      .catch(() =>
+        run(["osascript", "-l", "JavaScript", iconScript, app.bundle, out, String(ICON_PX)]),
+      )
+      .then(() => icons.set(app.name, out))
       .catch(() => icons.delete(app.name)); // retried the next time the app shows traffic
   }
 

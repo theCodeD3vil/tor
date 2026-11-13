@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { iconURL } from "@/stores/traffic";
 import { IconDeviceDesktop, IconMoon, IconSun, IconX } from "@tabler/icons-vue";
 import { useQuery, useQueryClient } from "@tanstack/vue-query";
 import type { TopApp } from "../../shared/types";
@@ -37,7 +38,11 @@ const queryClient = useQueryClient();
 // the hidden apps with their icons; refetched when the list changes
 const ignored = useQuery({
   queryKey: computed(() => ["ignored-apps", store.settings.ignoredApps.join("|")]),
-  queryFn: async () => (await window.tiny.api.call("getIgnoredApps")) as TopApp[],
+  queryFn: async () =>
+    ((await window.tiny.api.call("getIgnoredApps")) as TopApp[]).map((a) => ({
+      ...a,
+      icon: a.icon ? iconURL(a.icon) : a.icon,
+    })),
   staleTime: 1_000,
   // icons load in the background: ask again while any is missing
   refetchInterval: (query) => (query.state.data?.some((a) => !a.icon) ? 1_000 : false),

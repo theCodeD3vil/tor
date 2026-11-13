@@ -230,7 +230,7 @@ async function importLegacyUsage(app: TinyApp, usageDb: UsageDb): Promise<void> 
   usageDb.save(rows, "0000-00-00");
   await app.store.delete("appUsage");
 }
-const iconsSent = new Set<string>(); // icon data URLs are big: send each once per popover open
+const iconsSent = new Set<string>(); // each icon path is sent once per popover open
 
 function topApps(period: Period = appsPeriod): AppsPayload {
   const apps = appTracker!.top(getSettings().topApps, period).map((a) => {
@@ -428,6 +428,7 @@ export async function init(app: TinyApp): Promise<void> {
   appTracker = await createAppTracker(tempDir, usageDb.load(localDay(keepFrom)), {
     paused: !online,
     isIgnored: (name) => getSettings().ignoredApps.includes(name),
+    iconDir: `${(await app.paths()).data}/icons`,
   });
   // persist per-day app totals (7d / 30d history) every 30 s when they changed
   const flushUsage = (): void => {
