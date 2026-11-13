@@ -47,6 +47,7 @@ const NAMES_REFRESH_MS = 2000;
 // them), so a pid that left `ps` keeps its app this long
 const GONE_KEEP_MS = 15_000;
 const ICON_PX = 64;
+const ICON_RECHECK_MS = 10 * 60_000; // how often an app's bundle is looked at for a newer icon
 
 // JXA: render an app's NSWorkspace icon to a PNG (args: bundle path, out path, px)
 const ICON_SCRIPT = `ObjC.import("AppKit");
@@ -319,6 +320,7 @@ export async function createAppTracker(
   let sample: ProcSample[] = []; // the reading being read (nettop prints one per second)
   const pending = new Map<string, { down: number; up: number }>(); // pid → bytes seen before its app was known
   const icons = new Map<string, string | null>(); // app name → PNG path | null while rendering
+  const iconChecked = new Map<string, number>(); // app name → when its bundle was last looked at
   const primeUntil = Date.now() + 1600; // readings before this only set baselines
   let proc: ReturnType<typeof tjs.spawn> | undefined; // the running nettop (via script)
   let streamSeq = 0; // which stream() is current: an older one ending must not restart
@@ -411,18 +413,44 @@ export async function createAppTracker(
     return refreshing;
   }
 
-  // rendered once per app; a PNG left by an earlier launch is used as is
+  // Rendered once per app and kept across launches. The file is named after the
+  // bundle's modification time, so an app updated with a new icon gets a new file
+  // (and a new path, which is what tells the page to load it again); the bundle is
+  // looked at again every ICON_RECHECK_MS while the app keeps moving bytes.
   function loadIcon(app: AppRef): void {
-    if (icons.has(app.name)) return;
-    icons.set(app.name, null);
-    const out = `${iconDir}/${app.name.replace(/[^\w-]+/g, "_")}.png`;
+    const now = Date.now();
+    const checked = iconChecked.get(app.name);
+    if (checked !== undefined && now - checked < ICON_RECHECK_MS) return;
+    iconChecked.set(app.name, now);
+    const known = icons.get(app.name);
+    if (!icons.has(app.name)) icons.set(app.name, null);
+    const base = `${iconDir}/${app.name.replace(/[^\w-]+/g, "_")}`;
     tjs
-      .stat(out)
-      .catch(() =>
-        run(["osascript", "-l", "JavaScript", iconScript, app.bundle, out, String(ICON_PX)]),
-      )
-      .then(() => icons.set(app.name, out))
-      .catch(() => icons.delete(app.name)); // retried the next time the app shows traffic
+      .stat(app.bundle)
+      .then((st) => `${base}-${Math.floor(st.mtim.getTime() / 1000)}.png`)
+      .then(async (out) => {
+        if (out === known) return;
+        try {
+          await tjs.stat(out);
+        } catch {
+          await run([
+            "osascript",
+            "-l",
+            "JavaScript",
+            iconScript,
+            app.bundle,
+            out,
+            String(ICON_PX),
+          ]);
+        }
+        icons.set(app.name, out);
+        if (known) tjs.remove(known).catch(() => {}); // the icon it replaced
+      })
+      .catch(() => {
+        // no bundle (uninstalled) or no render: keep what there is, try again later
+        if (!known) icons.delete(app.name);
+        iconChecked.delete(app.name);
+      });
   }
 
   // Sums are read far more often than written (the tray repaints every second, the
@@ -613,7 +641,7 @@ export async function createAppTracker(
   function top(n: number, period: Period | number = "today"): TopApp[] {
     const source = history(typeof period === "number" ? period : (PERIOD_DAYS[period] ?? 1));
     for (const [name, v] of source) {
-      if (!icons.has(name) && v.bundle) loadIcon({ name, bundle: v.bundle });
+      if (v.bundle) loadIcon({ name, bundle: v.bundle });
     }
     return [...source.entries()]
       .map(([name, v]) => ({ name, down: v.down, up: v.up, icon: icons.get(name) ?? null }))
