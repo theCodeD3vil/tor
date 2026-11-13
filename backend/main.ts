@@ -167,6 +167,7 @@ export const api: Record<string, TinyApiHandler> = {
   getSettings: () => getSettings(),
   updateSettings: async (changes: unknown, app) => {
     const next = await updateSettings(changes, app);
+    appTracker?.invalidate(); // the hidden apps may have changed, and the sums leave them out
     void repaintTray?.(); // unit, colors and the menubar options all change the icon
     // hiding or showing an app changes the list and the totals at once
     if (popoverOpen && appTracker) {
@@ -229,22 +230,25 @@ async function importLegacyUsage(app: TinyApp, usageDb: UsageDb): Promise<void> 
   usageDb.save(rows, "0000-00-00");
   await app.store.delete("appUsage");
 }
-const iconsSent = new Set<string>(); // icon data URLs are big: send each once per popover open
+// each icon path is sent once, and again when it changes (the app's icon was updated)
+const iconsSent = new Map<string, string>();
+const sendIcon = (name: string, icon: string): boolean => {
+  if (iconsSent.get(name) === icon) return false;
+  iconsSent.set(name, icon);
+  return true;
+};
 
 function topApps(period: Period = appsPeriod): AppsPayload {
-  const apps = appTracker!.top(getSettings().topApps, period).map((a) => {
-    if (!a.icon || iconsSent.has(a.name)) return { ...a, icon: undefined };
-    iconsSent.add(a.name);
-    return a;
-  });
+  const apps = appTracker!
+    .top(getSettings().topApps, period)
+    .map((a) => (a.icon && sendIcon(a.name, a.icon) ? a : { ...a, icon: undefined }));
   return { period, apps };
 }
 // stats for the popover (7 / 30 / 90 days); the top app's icon is sent once like the list's
 function statsPayload(days: StatsRange): Stats {
   const stats = appTracker!.stats(days);
-  if (stats.topApp?.icon) {
-    if (iconsSent.has(stats.topApp.name)) stats.topApp.icon = undefined;
-    else iconsSent.add(stats.topApp.name);
+  if (stats.topApp?.icon && !sendIcon(stats.topApp.name, stats.topApp.icon)) {
+    stats.topApp.icon = undefined;
   }
   return stats;
 }
@@ -427,11 +431,12 @@ export async function init(app: TinyApp): Promise<void> {
   appTracker = await createAppTracker(tempDir, usageDb.load(localDay(keepFrom)), {
     paused: !online,
     isIgnored: (name) => getSettings().ignoredApps.includes(name),
+    iconDir: `${(await app.paths()).data}/icons`,
   });
   // persist per-day app totals (7d / 30d history) every 30 s when they changed
   const flushUsage = (): void => {
     const dirty = appTracker!.takeDirty();
-    if (dirty) usageDb.save(dirty.rows, dirty.pruneBefore);
+    if (dirty) usageDb.save(dirty.rows, dirty.pruneBefore, dirty.remove);
   };
   setInterval(flushUsage, 30_000);
   flushUsageOnQuit = flushUsage;

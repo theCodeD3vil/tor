@@ -25,6 +25,7 @@ export interface Snapshot {
 /** `icon` is a data URL; the backend sends each one only once, so it is often absent */
 export interface TopApp extends Traffic {
   name: string;
+  /** PNG path on disk (the page loads it through tiny.fileURL); sent once, then left out */
   icon?: string | null;
 }
 
