@@ -230,6 +230,23 @@ async function importLegacyUsage(app: TinyApp, usageDb: UsageDb): Promise<void> 
   usageDb.save(rows, "0000-00-00");
   await app.store.delete("appUsage");
 }
+// Problems that make the counts incomplete go to a short log in the app's logs folder:
+// a menubar app has no console anyone reads. Capped, so it cannot grow without end.
+const LOG_LINES = 200;
+async function appendLog(path: string, message: string): Promise<void> {
+  console.error(`tor: ${message}`);
+  try {
+    const old = await tjs.readFile(path).then(
+      (bytes) => new TextDecoder().decode(bytes),
+      () => "", // no log yet
+    );
+    const lines = `${old}${new Date().toISOString()} ${message}\n`.split("\n").filter(Boolean);
+    await tjs.writeFile(path, `${lines.slice(-LOG_LINES).join("\n")}\n`);
+  } catch {
+    // the log is a courtesy: never let it break the app
+  }
+}
+
 // each icon path is sent once, and again when it changes (the app's icon was updated)
 const iconsSent = new Map<string, string>();
 const sendIcon = (name: string, icon: string): boolean => {
@@ -428,10 +445,12 @@ export async function init(app: TinyApp): Promise<void> {
   await importLegacyUsage(app, usageDb);
   const keepFrom = new Date(Date.now() - 89 * 86_400_000);
   online = await isOnline().catch(() => true); // no answer: assume online and count
+  const logFile = `${(await app.paths()).logs}/tor.log`;
   appTracker = await createAppTracker(tempDir, usageDb.load(localDay(keepFrom)), {
     paused: !online,
     isIgnored: (name) => getSettings().ignoredApps.includes(name),
     iconDir: `${(await app.paths()).data}/icons`,
+    onProblem: (message) => void appendLog(logFile, message),
   });
   // persist per-day app totals (7d / 30d history) every 30 s when they changed
   const flushUsage = (): void => {
