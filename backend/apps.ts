@@ -207,6 +207,18 @@ const SERVER_ALIASES: { prefixes: string[]; bundleId: string }[] = [
   },
 ];
 
+// Coding agents that make their model calls from one background service shared by every
+// terminal: opencode starts "opencode serve --service" under launchd the first time and
+// every later session, from any terminal, only talks to it over loopback. Its responsible
+// process is whichever app started it first (Herdr, say), so all sessions' traffic would
+// be filed under that app, and no terminal could be told apart anyway. The service, and
+// what it runs for the agent, get a row of their own instead. Only processes with no
+// .app of their own are claimed: a GUI app an agent opens keeps its row. Adding an
+// agent: the name of its executable below.
+const AGENT_SERVICES: { exe: string; app: AppRef }[] = [
+  { exe: "opencode", app: { name: "opencode", bundle: "" } },
+];
+
 // JXA: where NSWorkspace finds the app with each bundle id (one path per line, "" if none)
 const APP_PATHS_SCRIPT = `ObjC.import("AppKit");
 function run(argv) {
@@ -363,6 +375,18 @@ export async function createAppTracker(
         const ownerPath = owner > 0 ? paths.get(String(owner)) : undefined;
         return (ownerPath && appOf(ownerPath)) || appOf(path);
       };
+      // an agent's service, or something it runs: its own row, ahead of the responsible app
+      const agentOf = (pid: string): AppRef | null => {
+        if (appOf(paths.get(pid) ?? "")) return null; // an app of its own keeps its row
+        for (let p: string | undefined = pid, hops = 0; p && p !== "1" && hops < 64; hops++) {
+          const path = paths.get(p) ?? "";
+          const exe = path.slice(path.lastIndexOf("/") + 1);
+          const agent = AGENT_SERVICES.find((a) => a.exe === exe);
+          if (agent) return agent.app;
+          p = parent.get(p);
+        }
+        return null;
+      };
       // the terminal behind a session: its client's app now, else the one last seen,
       // so a detached session keeps counting where it was shown
       const remember = (key: string, app: AppRef | null): AppRef | null => {
@@ -403,7 +427,7 @@ export async function createAppTracker(
       };
       const next = new Map<string, AppRef | null>();
       for (const pid of paths.keys()) {
-        next.set(pid, direct(pid) ?? sessionHostApp(pid));
+        next.set(pid, agentOf(pid) ?? direct(pid) ?? sessionHostApp(pid));
       }
       // just exited: keep the app for the readings nettop still prints for it
       const now = Date.now();
@@ -496,7 +520,7 @@ export async function createAppTracker(
     entry.up += up;
     touched.add(`${day}|${app.name}`);
     sums.clear();
-    loadIcon(app);
+    if (app.bundle) loadIcon(app); // a row with no bundle (opencode) has no icon to load
   }
 
   // sum of the last `days` calendar days, today included (shared: do not mutate)
