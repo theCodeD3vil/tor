@@ -71,14 +71,20 @@ function run(argv) {
 // Private libSystem call, so fall back to the executable path. It does not reach
 // into a detached session: its server is launched by launchd and is responsible for
 // itself and for everything inside (see SESSION_HOSTS).
+// libSystem is opened by its full path: the runtime tinyjs bundled up to txiki.js
+// 26.6 could not resolve the bare name "c", so the lookup was silently missing and
+// every terminal's traffic (curl, git, brew: no ".app" in their path) was dropped.
+const LIBSYSTEM = "/usr/lib/libSystem.B.dylib";
 let responsiblePid: ((pid: number) => number) | null = null;
+let lookupError: string | null = null; // why responsiblePid is missing, reported by createAppTracker
 try {
   const { dlopen } = await import("tjs:ffi");
-  const { symbols } = dlopen("c", {
+  const { symbols } = dlopen(LIBSYSTEM, {
     responsibility_get_pid_responsible_for_pid: { args: ["i32"], returns: "i32" },
   });
   responsiblePid = (pid) => symbols.responsibility_get_pid_responsible_for_pid(pid);
 } catch (err) {
+  lookupError = err instanceof Error ? err.message : String(err);
   console.error("tor apps: responsible-pid lookup unavailable:", err);
 }
 
@@ -279,6 +285,7 @@ export interface AppTracker {
  * @param iconDir where icon PNGs are kept, across launches (under readAccess, see tinyjs.json)
  * @param paused start without nettop (the Mac is offline); resume() starts it
  * @param isIgnored apps the user hid: still recorded, left out of top() and stats()
+ * @param onProblem told about anything that makes the counts incomplete (so it can be logged)
  */
 export async function createAppTracker(
   tempDir: string,
@@ -287,8 +294,19 @@ export async function createAppTracker(
     paused = false,
     isIgnored = (_name: string): boolean => false,
     iconDir,
-  }: { paused?: boolean; isIgnored?: (name: string) => boolean; iconDir: string },
+    onProblem = (_message: string): void => {},
+  }: {
+    paused?: boolean;
+    isIgnored?: (name: string) => boolean;
+    iconDir: string;
+    onProblem?: (message: string) => void;
+  },
 ): Promise<AppTracker> {
+  if (lookupError) {
+    onProblem(
+      `responsible-process lookup unavailable (${lookupError}): traffic from terminals and command-line tools is not counted`,
+    );
+  }
   const daily = saved;
   const touched = new Set<string>(); // "day|app" rows changed since the last save
   const removed: { day: string; app: string }[] = []; // rows merged into another app since the last save
