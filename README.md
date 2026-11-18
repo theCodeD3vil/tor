@@ -40,7 +40,7 @@ Tor keeps itself up to date: when it starts, and then daily, weekly or monthly a
 
 ## Good to know
 
-- **Apps are grouped under the app that started them.** Traffic from a program you run in a terminal counts toward the terminal app, and a browser's helper processes count toward the browser. The exception is opencode: its sessions share one background service, so it shows as its own entry.
+- **Apps are grouped under the app that started them.** Traffic from a program you run in a terminal counts toward the terminal app, and a browser's helper processes count toward the browser. The exception is OpenCode: its sessions share one background service, so it shows as its own entry, together with the OpenCode desktop app if you have it.
 - **Only traffic that leaves your Mac is counted.** Connections between programs on your own Mac are ignored.
 - **VPNs are fine.** Apps are counted whether or not their traffic goes through a VPN, and the VPN's own tunnel isn't counted on top of them. If a VPN still shows up in Top apps, hide it.
 - **History starts when you first open Tor.** Longer ranges fill up over time, up to 90 days.

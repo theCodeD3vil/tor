@@ -215,9 +215,36 @@ const SERVER_ALIASES: { prefixes: string[]; bundleId: string }[] = [
 // what it runs for the agent, get a row of their own instead. Only processes with no
 // .app of their own are claimed: a GUI app an agent opens keeps its row. Adding an
 // agent: the name of its executable below.
-const AGENT_SERVICES: { exe: string; app: AppRef }[] = [
-  { exe: "opencode", app: { name: "opencode", bundle: "" } },
+// An agent with a desktop app shares one row with it: the row is named after the .app (the
+// name its own traffic is filed under already), and `bundleId` finds the app so that the
+// row takes its icon (see resolveAliases). Without the app installed the row keeps an
+// empty bundle and the page shows its bundled logo (src/lib/bundledIcons.ts). `formerNames`
+// are names the row had before: history and hidden-app entries under them move to the
+// current name (see createAppTracker and currentAppName).
+interface AgentService {
+  exe: string;
+  app: AppRef;
+  bundleId?: string;
+  formerNames?: string[];
+}
+const AGENT_SERVICES: AgentService[] = [
+  {
+    exe: "opencode",
+    app: { name: "OpenCode", bundle: "" }, // "OpenCode.app", the desktop app
+    bundleId: "ai.opencode.desktop",
+    formerNames: ["opencode"], // the row's name in 0.1.12
+  },
 ];
+const FORMER_NAMES = new Map<string, AppRef>(
+  AGENT_SERVICES.flatMap((a) =>
+    (a.formerNames ?? []).map((name): [string, AppRef] => [name, a.app]),
+  ),
+);
+
+/** the name an app row has now: an older name of a renamed row maps to its current one */
+export function currentAppName(name: string): string {
+  return FORMER_NAMES.get(name)?.name ?? name;
+}
 
 // JXA: where NSWorkspace finds the app with each bundle id (one path per line, "" if none)
 const APP_PATHS_SCRIPT = `ObjC.import("AppKit");
@@ -230,11 +257,15 @@ function run(argv) {
 `;
 
 // Add an alias per installed terminal app for the server paths that run on its behalf.
-// Apps not installed are skipped: their servers cannot be running either.
+// Apps not installed are skipped: their servers cannot be running either. An agent's row
+// (AGENT_SERVICES) gets the bundle of its desktop app when that is installed.
 async function resolveAliases(dir: string): Promise<void> {
   const script = `${dir}/apppaths.jxa.js`;
   await tjs.writeFile(script, APP_PATHS_SCRIPT);
-  const ids = SERVER_ALIASES.map((a) => a.bundleId);
+  const agents = AGENT_SERVICES.filter(
+    (a): a is AgentService & { bundleId: string } => !!a.bundleId,
+  );
+  const ids = [...SERVER_ALIASES.map((a) => a.bundleId), ...agents.map((a) => a.bundleId)];
   const out = await tryRun(["osascript", "-l", "JavaScript", script, ...ids]);
   const lines = out.replace(/\n$/, "").split("\n");
   SERVER_ALIASES.forEach(({ prefixes }, i) => {
@@ -242,6 +273,12 @@ async function resolveAliases(dir: string): Promise<void> {
     const name = bundle?.match(/([^/]+)\.app$/)?.[1];
     if (!bundle || !name) return;
     for (const prefix of prefixes) APP_ALIASES.push({ prefix, app: { name, bundle } });
+  });
+  agents.forEach((agent, i) => {
+    const bundle = lines[SERVER_ALIASES.length + i];
+    // only an app that carries the row's name: appOf() derives the name of the app's own
+    // traffic from the file name, so a renamed copy would be a row of its own
+    if (bundle && bundle.match(/([^/]+)\.app$/)?.[1] === agent.app.name) agent.app.bundle = bundle;
   });
 }
 
@@ -328,15 +365,16 @@ export async function createAppTracker(
   await tjs.makeDir(iconDir, { recursive: true });
   await resolveAliases(scriptDir);
   // History recorded under a server's own name before its alias existed ("Herdr Core",
-  // "Rex Server") is folded into the app it stands for, so the list shows one entry
+  // "Rex Server"), or under a row's earlier name ("opencode"), is folded into the app it
+  // stands for, so the list shows one entry
   for (const [day, apps] of Object.entries(daily)) {
     for (const [name, v] of Object.entries(apps)) {
-      const app = v.bundle ? appOf(v.bundle) : null;
+      const app = FORMER_NAMES.get(name) ?? (v.bundle ? appOf(v.bundle) : null);
       if (!app || app.name === name) continue;
       const into = (apps[app.name] ??= { down: 0, up: 0, bundle: app.bundle });
       into.down += v.down;
       into.up += v.up;
-      into.bundle = app.bundle;
+      if (app.bundle) into.bundle = app.bundle; // not blanked when the app is not installed now
       delete apps[name];
       touched.add(`${day}|${app.name}`);
       removed.push({ day, app: name });
@@ -516,11 +554,12 @@ export async function createAppTracker(
     const day = dayKey(new Date());
     const today = (daily[day] ??= {});
     const entry = (today[app.name] ??= { down: 0, up: 0, bundle: app.bundle });
+    if (app.bundle) entry.bundle = app.bundle; // a row made before its app was installed learns the bundle
     entry.down += down;
     entry.up += up;
     touched.add(`${day}|${app.name}`);
     sums.clear();
-    if (app.bundle) loadIcon(app); // a row with no bundle (opencode) has no icon to load
+    if (app.bundle) loadIcon(app); // a row with no bundle (OpenCode, app not installed) has no icon to load
   }
 
   // sum of the last `days` calendar days, today included (shared: do not mutate)
@@ -535,6 +574,7 @@ export async function createAppTracker(
       for (const [name, v] of Object.entries(day ?? {})) {
         if (isIgnored(name)) continue;
         const t = totals.get(name) ?? { down: 0, up: 0, bundle: v.bundle };
+        if (!t.bundle) t.bundle = v.bundle; // days from before the app was installed have none
         t.down += v.down;
         t.up += v.up;
         totals.set(name, t);

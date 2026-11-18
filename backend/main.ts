@@ -11,7 +11,7 @@ import type {
   TopApp,
   UpdateStatus,
 } from "../shared/types";
-import { createAppTracker, type AppTracker } from "./apps";
+import { createAppTracker, currentAppName, type AppTracker } from "./apps";
 import { openUsageDb, type UsageDb } from "./db";
 import { colorHex, type MenubarValue, type SpeedUnit } from "../shared/settings";
 import { iconKey, type IconOptions, type Value } from "../shared/trayIcon";
@@ -392,6 +392,11 @@ export async function init(app: TinyApp): Promise<void> {
   const tempDir = (await app.paths()).temp;
   const dir = await tjs.makeTempDir(`${tempDir}/tor-icon-XXXXXX`);
   await loadSettings(app);
+  // an app hidden under a name its row no longer has stays hidden under the new one
+  const hidden = getSettings().ignoredApps;
+  if (hidden.some((name) => currentAppName(name) !== name)) {
+    await updateSettings({ ignoredApps: [...new Set(hidden.map(currentAppName))] }, app);
+  }
   await loadUpdateState(app);
   let iconSeq = 0;
   let requestedIcon = ""; // iconKey of the icon last asked of the page

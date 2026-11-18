@@ -1,5 +1,7 @@
 <script setup lang="ts">
 import { iconURL } from "@/stores/traffic";
+import AppIcon from "@/components/AppIcon.vue";
+import { bundledIcon } from "@/lib/bundledIcons";
 import { IconDeviceDesktop, IconMoon, IconSun, IconX } from "@tabler/icons-vue";
 import { useQuery, useQueryClient } from "@tanstack/vue-query";
 import type { TopApp } from "../../shared/types";
@@ -44,8 +46,10 @@ const ignored = useQuery({
       icon: a.icon ? iconURL(a.icon) : a.icon,
     })),
   staleTime: 1_000,
-  // icons load in the background: ask again while any is missing
-  refetchInterval: (query) => (query.state.data?.some((a) => !a.icon) ? 1_000 : false),
+  // icons load in the background: ask again while any is missing (one with a bundled logo
+  // is not: its row may never have an app to render one from)
+  refetchInterval: (query) =>
+    query.state.data?.some((a) => !a.icon && !bundledIcon(a.name)) ? 1_000 : false,
 });
 
 // an app shown again counts in the list and the totals at once
@@ -242,19 +246,7 @@ const valueOptions: { value: MenubarValue; label: string }[] = [
         :key="app.name"
         class="flex items-center gap-2.5 px-4 py-2.5"
       >
-        <img
-          v-if="app.icon"
-          :src="app.icon"
-          alt=""
-          class="size-7 shrink-0 rounded-md"
-          draggable="false"
-        />
-        <div
-          v-else
-          class="flex size-7 shrink-0 items-center justify-center rounded-md bg-foreground/10 text-xs font-semibold"
-        >
-          {{ app.name.slice(0, 1) }}
-        </div>
+        <AppIcon :name="app.name" :src="app.icon" class="size-7 rounded-md" />
         <span class="min-w-0 flex-1 truncate text-sm font-medium text-foreground/90">
           {{ app.name }}
         </span>
