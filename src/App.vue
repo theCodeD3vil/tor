@@ -21,6 +21,7 @@ import UpdatePage from "@/pages/UpdatePage.vue";
 import AboutPage from "@/pages/AboutPage.vue";
 import SettingsPage from "@/pages/SettingsPage.vue";
 import StatTile from "@/components/StatTile.vue";
+import AppIcon from "@/components/AppIcon.vue";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useUpdates } from "@/composables/useUpdates";
 import { useAppearance } from "@/composables/useAppearance";
@@ -288,19 +289,7 @@ onUnmounted(() => {
                   :key="app.name"
                   class="app-row group flex items-center gap-2.5"
                 >
-                  <img
-                    v-if="app.icon"
-                    :src="app.icon"
-                    alt=""
-                    class="size-8 shrink-0 rounded-lg"
-                    draggable="false"
-                  />
-                  <div
-                    v-else
-                    class="flex size-8 shrink-0 items-center justify-center rounded-lg bg-foreground/10 text-xs font-semibold"
-                  >
-                    {{ app.name.slice(0, 1) }}
-                  </div>
+                  <AppIcon :name="app.name" :src="app.icon" class="size-8 rounded-lg" />
                   <div class="flex min-w-0 flex-1 flex-col gap-1">
                     <div class="flex items-baseline justify-between gap-2 text-xs">
                       <span class="min-w-0 truncate font-medium">{{ app.name }}</span>
@@ -407,19 +396,11 @@ onUnmounted(() => {
                     class="flex w-full min-w-0 items-center justify-between gap-3"
                   >
                     <div class="flex min-w-0 items-center gap-2.5">
-                      <img
-                        v-if="stats.topApp.icon"
+                      <AppIcon
+                        :name="stats.topApp.name"
                         :src="stats.topApp.icon"
-                        alt=""
-                        class="size-8 shrink-0 rounded-lg"
-                        draggable="false"
+                        class="size-8 rounded-lg"
                       />
-                      <div
-                        v-else
-                        class="flex size-8 shrink-0 items-center justify-center rounded-lg bg-foreground/10 text-xs font-semibold"
-                      >
-                        {{ stats.topApp.name.slice(0, 1) }}
-                      </div>
                       <p class="truncate text-sm font-semibold">{{ stats.topApp.name }}</p>
                     </div>
                     <p class="shrink-0 text-3xl leading-none font-bold tracking-tight tabular-nums">
