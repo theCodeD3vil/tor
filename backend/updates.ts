@@ -42,10 +42,21 @@ export async function checkForUpdates(
   manual: boolean,
   onStatus: (status: UpdateStatus) => void,
 ): Promise<UpdateStatus> {
-  if (!isInstalledApp()) {
-    status = { ...status, state: "unsupported" };
-    return status;
+  checking ??= performCheck(app).finally(() => {
+    checking = undefined;
+  });
+  const next = await checking;
+  if (!manual && next.state === "available" && notifiedVersion !== next.latest) {
+    notifiedVersion = next.latest;
+    void app.notify("Tor update available", `Tor ${next.latest} is ready to install`);
   }
+  onStatus(next);
+  return next;
+}
+
+let checking: Promise<UpdateStatus> | undefined;
+async function performCheck(app: TinyApp): Promise<UpdateStatus> {
+  if (!isInstalledApp()) return (status = { ...status, state: "unsupported" });
   try {
     const result = await app.update.check();
     status = {
@@ -55,16 +66,12 @@ export async function checkForUpdates(
       notes: result.notes,
       lastChecked: Date.now(),
     };
-    await app.store.set(STATE_KEY, { lastChecked: status.lastChecked });
-    if (!manual && status.state === "available" && notifiedVersion !== status.latest) {
-      notifiedVersion = status.latest;
-      void app.notify("Tor update available", `Tor ${status.latest} is ready to install`);
-    }
+    await app.store.set(STATE_KEY, { lastChecked: status.lastChecked }).catch(console.error);
   } catch {
-    // offline, the release server is down, or no update URL is configured
-    status = { ...status, state: "error" };
+    // offline, the release server is down, or no update URL is configured.
+    // drop the previous notes: a failed check must not keep rendering them
+    status = { ...status, state: "error", latest: null, notes: null };
   }
-  onStatus(status);
   return status;
 }
 
@@ -102,7 +109,7 @@ function trackDownload(response: Response, onProgress: (progress: UpdateProgress
 // update.install() follows redirects one hop at a time, and GitHub answers the .zip URL
 // with an empty 302 to a signed blob URL (a bare path plus a query string) that carries
 // the bytes. Only that final, successful hop is worth counting.
-export function isUpdateArchive(url: string, response: Response): boolean {
+function isUpdateArchive(url: string, response: Response): boolean {
   if (!response.ok || !response.body) return false;
   const disposition = response.headers.get("content-disposition") ?? "";
   const named = /filename\*?=(?:UTF-8'')?"?([^";]+)/i.exec(disposition)?.[1];
@@ -122,31 +129,36 @@ export function isUpdateArchive(url: string, response: Response): boolean {
   return /\.(zip|tar\.gz|tgz)$/i.test(name);
 }
 
-/** report the bytes of every update archive fetched until the returned function is called */
-export function watchDownloads(onProgress: (progress: UpdateProgress) => void): () => void {
-  // update.install() reports no progress, but it downloads through the global fetch
-  const originalFetch = globalThis.fetch;
+// There is exactly one install at a time. Scope the fetch patch to that install.
+function watchDownloads(onProgress: (progress: UpdateProgress) => void): () => void {
+  const base = globalThis.fetch;
   globalThis.fetch = async (input, init) => {
-    const response = await originalFetch(input, init);
+    const response = await base(input, init);
     const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
     if (isUpdateArchive(url, response)) trackDownload(response, onProgress);
     return response;
   };
   return () => {
-    globalThis.fetch = originalFetch;
+    globalThis.fetch = base;
   };
 }
+
+let installing = false;
 
 /** download the update and relaunch into it */
 export async function installUpdate(
   app: TinyApp,
   onProgress: (progress: UpdateProgress) => void,
 ): Promise<void> {
+  if (installing) return;
+  if (status.state !== "available") throw new Error("No update is available");
+  installing = true;
   const unwatch = watchDownloads(onProgress);
   try {
     await app.update.install();
   } finally {
     unwatch();
+    installing = false;
   }
 }
 

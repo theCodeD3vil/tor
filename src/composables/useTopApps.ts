@@ -1,6 +1,6 @@
 import { useQuery, useQueryClient } from "@tanstack/vue-query";
 import { computed, onMounted, onUnmounted } from "vue";
-import type { AppsPayload, Period, TopApp } from "../../shared/types";
+import { appId, type AppsPayload, type Period, type TopApp } from "../../shared/types";
 import { useTrafficStore } from "@/stores/traffic";
 
 const key = (period: Period) => ["top-apps", period] as const;
@@ -35,7 +35,7 @@ export function useTopApps() {
   onUnmounted(() => off?.());
 
   const apps = computed(() =>
-    (query.data.value ?? []).map((app) => ({ ...app, icon: traffic.icons[app.name] })),
+    (query.data.value ?? []).map((app) => ({ ...app, icon: traffic.icons[appId(app)] })),
   );
   return { apps, isLoading: query.isPending };
 }

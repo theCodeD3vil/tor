@@ -1,11 +1,12 @@
 import { defineStore } from "pinia";
 import { ref } from "vue";
-import type { Period, Snapshot, TopApp, Traffic } from "../../shared/types";
+import { appId, type Period, type Snapshot, type TopApp, type Traffic } from "../../shared/types";
 
 // Live traffic pushed by the backend once a second (see backend/main.ts).
 // The top-apps list lives in TanStack Query (src/composables/useTopApps.ts).
-/** the backend names icons by path; the page loads them through the launcher */
-export const iconURL = (path: string): string => window.tiny?.fileURL?.(path) ?? path;
+/** icons arrive as data URLs; a leftover path still goes through the launcher */
+export const iconURL = (path: string): string =>
+  path.startsWith("data:") ? path : (window.tiny?.fileURL?.(path) ?? path);
 
 export const useTrafficStore = defineStore("traffic", () => {
   const rate = ref<Traffic>({ down: 0, up: 0 }); // bytes/s
@@ -21,7 +22,14 @@ export const useTrafficStore = defineStore("traffic", () => {
   }
 
   function absorbIcons(list: TopApp[]): void {
-    for (const a of list) if (a.icon) icons.value[a.name] = iconURL(a.icon);
+    const received: [string, number][] = [];
+    for (const a of list) {
+      if (!a.icon) continue;
+      const id = appId(a);
+      icons.value[id] = iconURL(a.icon);
+      if (a.iconRevision) received.push([id, a.iconRevision]);
+    }
+    if (received.length) void window.tiny?.api.call("cacheIcons", received);
   }
 
   function apply(snapshot: Snapshot): void {

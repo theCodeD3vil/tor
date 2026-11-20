@@ -1,10 +1,8 @@
 name: Release
 
-# A PR merged into main releases the "version" in tinyjs.json, unless that
-# version is already tagged — so bump it in the PR to ship a release.
+# Only main builds release drafts. The update key never reaches GitHub Actions.
 on:
-  pull_request:
-    types: [closed]
+  push:
     branches: [main]
 
 permissions:
@@ -16,96 +14,147 @@ concurrency:
 
 jobs:
   version:
-    if: github.event.pull_request.merged
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
       is-new: ${{ steps.version.outputs.is-new }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
-          ref: ${{ github.event.pull_request.merge_commit_sha }}
-          sparse-checkout: tinyjs.json
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          sparse-checkout: |
+            tinyjs.json
+            .github/scripts/release-manifest.mjs
           sparse-checkout-cone-mode: false
 
       - id: version
         run: |
-          version=$(jq -r .version tinyjs.json)
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          if git ls-remote --exit-code --tags origin "refs/tags/v$version" > /dev/null; then
-            echo "::notice::v$version is already released. Bump \"version\" in tinyjs.json to publish a new release."
+          set -euo pipefail
+          version=$(node .github/scripts/release-manifest.mjs version)
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+          if git ls-remote --exit-code --tags origin "refs/tags/v$version" >/dev/null; then
             echo "is-new=false" >> "$GITHUB_OUTPUT"
-          else
+          elif [ "$?" -eq 2 ]; then
             echo "is-new=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::could not check release tags"
+            exit 1
           fi
 
   release:
     needs: version
     if: needs.version.outputs.is-new == 'true'
     runs-on: macos-15
+    environment: release
     permissions:
       contents: write
+      pull-requests: read
+      id-token: write
+      attestations: write
     env:
       VERSION: ${{ needs.version.outputs.version }}
+      GH_REPO: ${{ github.repository }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
-          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          ref: ${{ github.sha }}
+          persist-credentials: false
 
-      - uses: oven-sh/setup-bun@v2
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
-          bun-version: 1.4.0
+          bun-version: 1.4.4
 
       - run: bun install --frozen-lockfile
 
-      - name: Install tinyjs
-        env:
-          TINYJS_VERSION: v0.70.3
+      - name: Check and test
         run: |
-          curl -fsSL https://tinyjs.app/install | sh
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH" # the installer's fallback link folder
+          bun run check
+          bun run test
 
-      # Shown on the release page and in the in-app update prompt
-      - name: Write release notes
-        env:
-          PR_TITLE: ${{ github.event.pull_request.title }}
-          PR_BODY: ${{ github.event.pull_request.body }}
-        run: printf '%s\n\n%s\n' "$PR_TITLE" "$PR_BODY" > "$RUNNER_TEMP/notes.md"
-
-      # One runner builds both CPUs. Each publish builds the app, its dmg and
-      # its zip, and merges the zip into one manifest.json. The frontend
-      # build (Vite) empties dist/ at the start of every publish, so each dmg
-      # moves out before the next one; publish keeps dist/publish safe itself.
-      # Apple's timestamp server, which codesign calls, drops the odd request,
-      # hence one retry per publish.
-      - name: Build and package
-        run: |
-          retry() { "$@" || "$@"; }
-          mkdir "$RUNNER_TEMP/dmg"
-          for arch in arm64 x86_64; do
-            retry tinyjs publish --arch "$arch" --dmg --notes-file "$RUNNER_TEMP/notes.md"
-            mv dist/*.dmg "$RUNNER_TEMP/dmg/"
-          done
-          # Installed apps only update from the manifest: both CPUs must be in it
-          jq -e '.mac.arm64 and .mac.x86_64' dist/publish/manifest.json > /dev/null
-          # tinyjs points the zips at update.url's folder (releases/latest);
-          # pin them to this release's tag instead
-          sed -i '' "s#/releases/latest/download/#/releases/download/v$VERSION/#" dist/publish/manifest.json
-
-      - name: Create release
+      - name: Write and validate the merged PR's release notes
         env:
           GH_TOKEN: ${{ github.token }}
-          MERGE_COMMIT: ${{ github.event.pull_request.merge_commit_sha }}
         run: |
-          gh release create "v$VERSION" \
-            --target "$MERGE_COMMIT" \
-            --title "Tor $VERSION" \
-            --notes-file "$RUNNER_TEMP/notes.md" \
-            "$RUNNER_TEMP"/dmg/*.dmg dist/publish/*.zip dist/publish/manifest.json
+          set -euo pipefail
+          # Draft tags don't exist yet. Check all pages rather than relying on git tags.
+          if ! gh api --paginate "repos/$GH_REPO/releases?per_page=100" |
+            jq -se --arg tag "v$VERSION" 'add | all(.tag_name != $tag)' >/dev/null; then
+            echo "::error::Could not check drafts, or v$VERSION already has a release."
+            exit 1
+          fi
+          pr=$(gh api "repos/$GH_REPO/commits/$GITHUB_SHA/pulls" \
+            | jq -c --arg sha "$GITHUB_SHA" \
+              '[.[] | select(.merged_at != null and .base.ref == "main" and .merge_commit_sha == $sha)][0] // empty')
+          if [ -z "$pr" ]; then
+            echo "::error::The version bump must be merged from a pull request into main."
+            exit 1
+          fi
+          printf '%s\n\n%s\n' "$(jq -r .title <<< "$pr")" "$(jq -r '.body // ""' <<< "$pr")" > "$RUNNER_TEMP/notes.md"
+          bun .github/scripts/release-notes.mjs "$RUNNER_TEMP/notes.md"
 
-      # A dead link here is an updater failing silently on users' Macs
-      - name: Verify update links
+      - name: Install checksum-pinned TinyJS
+        env:
+          TINYJS_VERSION: v0.75.1
+          TINYJS_SHA256: 4f70990877763ba3a621173e678a139cf6076eefca8b25b00e90079d0f90b37d
         run: |
-          curl -fsSL "https://github.com/$GITHUB_REPOSITORY/releases/latest/download/manifest.json" \
-            | jq -e --arg version "$VERSION" '.version == $version' > /dev/null
-          jq -r '.. | .url? // empty' dist/publish/manifest.json | sort -u | xargs -n 1 curl -fsSIL -o /dev/null
+          set -euo pipefail
+          archive="$RUNNER_TEMP/tinyjs.tar.gz"
+          curl -fsSL -o "$archive" \
+            "https://github.com/tarwin/tinyjsapp/releases/download/$TINYJS_VERSION/tinyjs-macos-arm64.tar.gz"
+          printf '%s  %s\n' "$TINYJS_SHA256" "$archive" | shasum -a 256 -c -
+          mkdir -p "$HOME/.tinyjs" "$HOME/.local/bin"
+          tar -xzf "$archive" -C "$HOME/.tinyjs" --strip-components 1
+          ln -sf "$HOME/.tinyjs/tinyjs" "$HOME/.local/bin/tinyjs"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Import the macOS code-signing certificate
+        env:
+          CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "$CERTIFICATE_P12" ] || [ -z "$CERTIFICATE_PASSWORD" ]; then
+            echo "::error::Configure the Tor certificate using bun run release:secrets."
+            exit 1
+          fi
+          umask 077
+          keychain="$RUNNER_TEMP/tor-signing.keychain-db"
+          certificate="$RUNNER_TEMP/tor-signing.p12"
+          trap 'rm -f "$certificate"' EXIT
+          keychain_password=$(openssl rand -hex 16)
+          printf '%s' "$CERTIFICATE_P12" | base64 --decode > "$certificate"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 3600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$certificate" -k "$keychain" -P "$CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain" "$HOME/Library/Keychains/login.keychain-db"
+          identity=$(security find-identity -p codesigning "$keychain" | awk '/ 1\) / { print $2; exit }')
+          [[ "$identity" =~ ^[[:xdigit:]]{40}$ ]]
+          printf 'TINYJS_SIGN_IDENTITY=%s\n' "$identity" >> "$GITHUB_ENV"
+
+      - name: Build and package both architectures
+        run: bun .github/scripts/package-release.mjs "$RUNNER_TEMP/notes.md" "$RUNNER_TEMP/release"
+
+      - name: Remove the temporary signing keychain
+        if: always()
+        run: |
+          keychain="$RUNNER_TEMP/tor-signing.keychain-db"
+          if [ -f "$keychain" ]; then security delete-keychain "$keychain"; fi
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/release/*
+
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "v$VERSION" --repo "$GH_REPO" --draft \
+            --target "$GITHUB_SHA" --title "Tor $VERSION" \
+            --notes-file "$RUNNER_TEMP/notes.md" "$RUNNER_TEMP"/release/*
+          printf '### Tor %s is a draft\nVerify, sign, and publish on your Mac: %s\n' \
+            "$VERSION" "\`bun run release:publish $VERSION\`" >> "$GITHUB_STEP_SUMMARY"

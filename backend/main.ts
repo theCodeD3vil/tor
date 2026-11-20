@@ -12,8 +12,9 @@ import type {
   UpdateStatus,
 } from "../shared/types";
 import { createAppTracker, type AppTracker } from "./apps";
+import { counterDelta, readCounters } from "./counters";
 import { openUsageDb, type UsageDb } from "./db";
-import { colorHex, type MenubarValue, type SpeedUnit } from "../shared/settings";
+import { colorHex, isIgnoredApp, type MenubarValue, type SpeedUnit } from "../shared/settings";
 import { iconKey, type IconOptions, type Value } from "../shared/trayIcon";
 import { isOnline, watchNetwork, type NetworkWatcher } from "./network";
 import { getSettings, loadSettings, updateSettings } from "./settings";
@@ -37,25 +38,6 @@ interface Sample extends Traffic {
   t: number; // ms timestamp
 }
 const history: Sample[] = []; // per-second { down, up } in bytes, newest last
-
-// -n: without it netstat reverse-resolves every interface address, which can take
-// many seconds (or 30 s) behind a VPN's DNS, and the tick waits on it
-async function readCounters(): Promise<{ rx: number; tx: number }> {
-  const proc = tjs.spawn(["netstat", "-ibn"], { stdout: "pipe", stderr: "ignore" });
-  const text = await proc.stdout!.text();
-  await proc.wait();
-  let rx = 0;
-  let tx = 0;
-  for (const line of text.split("\n")) {
-    const cols = line.trim().split(/\s+/);
-    // physical interfaces only (en0, en1, …), one <Link#n> row each
-    if (!cols[0]?.startsWith("en") || !cols[2]?.startsWith("<Link#")) continue;
-    // columns from the end: Ibytes Opkts Oerrs Obytes Coll
-    rx += Number(cols[cols.length - 5]) || 0;
-    tx += Number(cols[cols.length - 2]) || 0;
-  }
-  return { rx, tx };
-}
 
 const RATE_UNITS: Record<SpeedUnit, string[]> = {
   MBps: ["KB/s", "MB/s", "GB/s"],
@@ -84,7 +66,9 @@ const totalValue = (bytes: number): Value => scaled(bytes / 1000, TOTAL_UNITS);
 // what the menubar icon shows right now, from the settings and the live numbers
 function trayOptions(): IconOptions {
   const settings = getSettings();
-  const today = appTracker?.stats(1).totals ?? { down: 0, up: 0 };
+  const today = settings.menubarValue.includes("total")
+    ? (appTracker?.todayTotals() ?? { down: 0, up: 0 })
+    : { down: 0, up: 0 };
   const rate = (n: number): Value => rateValue(n, settings.unit);
   const shown: Record<
     MenubarValue,
@@ -104,9 +88,10 @@ function trayOptions(): IconOptions {
   const { values, arrows, totals } = shown[settings.menubarValue];
   return {
     icon: settings.menubarIcon,
-    bars: buckets(),
     values,
     arrows,
+    // the bars are thrown away unless the menubar actually draws them
+    bars: settings.menubarIcon === "bars" ? buckets() : [],
     units: totals ? TOTAL_UNITS : RATE_UNITS[settings.unit],
     colors: { down: colorHex(settings.downloadColor), up: colorHex(settings.uploadColor) },
     offline: !online,
@@ -141,13 +126,15 @@ function series(): SeriesPoint[] {
 
 // Total bytes per bucket, oldest → newest; the newest bar always ends "now".
 function buckets(): Traffic[] {
-  const padded = Array.from({ length: HISTORY_S - history.length }, () => ({ down: 0, up: 0 }));
-  padded.push(...history);
-  return Array.from({ length: BUCKETS }, (_, i) =>
-    padded
-      .slice(i * BUCKET_S, (i + 1) * BUCKET_S)
-      .reduce((acc, s) => ({ down: acc.down + s.down, up: acc.up + s.up }), { down: 0, up: 0 }),
-  );
+  const totals = Array.from({ length: BUCKETS }, () => ({ down: 0, up: 0 }));
+  const now = Date.now();
+  for (const s of history) {
+    const slot = BUCKETS - 1 - Math.floor((now - s.t) / (BUCKET_S * 1000));
+    if (slot < 0 || slot >= BUCKETS) continue;
+    totals[slot].down += s.down;
+    totals[slot].up += s.up;
+  }
+  return totals;
 }
 
 const PERIODS: Period[] = ["today", "7d", "30d"];
@@ -155,9 +142,24 @@ const STATS_RANGES: StatsRange[] = [7, 30, 90];
 let appsPeriod: Period = "today"; // which top-apps tab the popover shows
 
 export const api: Record<string, TinyApiHandler> = {
+  openExternalLink: (params: unknown, app) => {
+    if (!params || typeof params !== "object" || !("url" in params)) return;
+    if (typeof params.url !== "string" || params.url.length > 4096) return;
+    let url: URL;
+    try {
+      url = new URL(params.url);
+    } catch {
+      return;
+    }
+    if (url.protocol === "https:" && !url.username && !url.password)
+      return app.shell.open(url.href);
+  },
   // the page reports a blur (click outside); the panel hides itself like teneo's
   hidePopover: (_params, app) => {
-    if (popoverOpen) hidePopover(app);
+    if (popoverOpen || opening) hidePopover(app);
+  },
+  setPage: ({ page }: { page: string }) => {
+    popoverPage = page === "home" ? "home" : "other";
   },
   setAppsPeriod: ({ period }: { period: Period }) => {
     appsPeriod = PERIODS.includes(period) ? period : "today";
@@ -178,28 +180,49 @@ export const api: Record<string, TinyApiHandler> = {
   },
   getUpdateStatus: () => getUpdateStatus(),
   checkForUpdates: (_params, app) => checkForUpdates(app, true, pushUpdateStatus(app)),
-  installUpdate: (_params, app) =>
-    installUpdate(app, (progress) => app.window(POPOVER.id).push("update-progress", progress)),
+  installUpdate: (_params, app) => {
+    flushUsageOnQuit?.();
+    return installUpdate(app, (progress) =>
+      app.window(POPOVER.id).push("update-progress", progress),
+    );
+  },
   getVersion: async (_params, app) => (await app.info()).version,
   // the hidden apps with their icons, for the settings page
-  getIgnoredApps: (): TopApp[] =>
-    getSettings().ignoredApps.map((name) => ({
-      name,
+  getIgnoredApps: (): TopApp[] => {
+    return getSettings().ignoredApps.map((entry) => ({
+      name: entry.name,
       down: 0,
       up: 0,
-      icon: appTracker?.icon(name) ?? null,
-    })),
+      bundle: entry.bundle,
+      icon: appTracker?.icon(entry) ?? null,
+    }));
+  },
   // the page (re)loaded and lost its icon cache: send every icon again once
   resetIcons: () => iconsSent.clear(),
+  cacheIcons: (params: unknown) => {
+    if (!Array.isArray(params) || params.length > 40) return;
+    for (const entry of params) {
+      if (!Array.isArray(entry) || typeof entry[0] !== "string" || entry[0].length > 4096) continue;
+      if (!Number.isSafeInteger(entry[1]) || entry[1] < 1) continue;
+      if (iconsSent.size >= 512 && !iconsSent.has(entry[0])) {
+        const first = iconsSent.keys().next();
+        if (!first.done) iconsSent.delete(first.value);
+      }
+      iconsSent.set(entry[0], entry[1]);
+    }
+  },
   // the page has applied what it was sent and rendered it (see togglePopover)
-  popoverReady: () => {
-    resolveReady?.();
+  popoverReady: (params?: { generation?: number }) => {
+    if (params?.generation === openGen) resolveReady?.();
   },
   getApps: ({ period }: { period: Period }) => topApps(PERIODS.includes(period) ? period : "today"),
   getStats: ({ days }: { days: StatsRange }) =>
     statsPayload(STATS_RANGES.includes(days) ? days : 30),
   // the page drew the menubar icon it was asked for (see setTray in init)
-  setTrayIcon: ({ png }: { png: string }) => trayIcons?.set(png),
+  setTrayIcon: (params?: { png?: unknown; token?: number }) => {
+    if (typeof params?.token !== "number") return;
+    return trayIcons?.set(params.png, params.token);
+  },
   // the page (re)loaded: it has drawn nothing yet, so ask it for the current icon
   trayIconReady: () => trayIcons?.reset(),
 };
@@ -211,7 +234,9 @@ const pushUpdateStatus = (app: TinyApp) => (status: UpdateStatus) =>
   app.window(POPOVER.id).push("update-status", status);
 
 let repaintTray: (() => Promise<void>) | undefined;
-let trayIcons: { set(png: string): Promise<void>; reset(): Promise<void> } | undefined;
+let trayIcons: { set(png: unknown, token: number): Promise<void>; reset(): void } | undefined;
+let usageDb: UsageDb | undefined;
+let iconTempDir = "";
 let flushUsageOnQuit: (() => void) | undefined;
 
 const localDay = (d: Date): string =>
@@ -233,41 +258,43 @@ async function importLegacyUsage(app: TinyApp, usageDb: UsageDb): Promise<void> 
 // Problems that make the counts incomplete go to a short log in the app's logs folder:
 // a menubar app has no console anyone reads. Capped, so it cannot grow without end.
 const LOG_LINES = 200;
-async function appendLog(path: string, message: string): Promise<void> {
-  console.error(`tor: ${message}`);
-  try {
-    const old = await tjs.readFile(path).then(
-      (bytes) => new TextDecoder().decode(bytes),
-      () => "", // no log yet
-    );
-    const lines = `${old}${new Date().toISOString()} ${message}\n`.split("\n").filter(Boolean);
-    await tjs.writeFile(path, `${lines.slice(-LOG_LINES).join("\n")}\n`);
-  } catch {
-    // the log is a courtesy: never let it break the app
-  }
+let logChain: Promise<void> = Promise.resolve();
+function appendLog(path: string, message: string): void {
+  const line = message.replace(/[\r\n]+/g, " ").slice(0, 500);
+  console.error(`tor: ${line}`);
+  // one write at a time: overlapping read-modify-writes drop lines
+  logChain = logChain.then(async () => {
+    try {
+      const old = await tjs.readFile(path).then(
+        (bytes) => new TextDecoder().decode(bytes),
+        () => "", // no log yet
+      );
+      const lines = `${old}${new Date().toISOString()} ${line}\n`.split("\n").filter(Boolean);
+      await tjs.writeFile(path, `${lines.slice(-LOG_LINES).join("\n")}\n`);
+    } catch {
+      // the log is a courtesy: never let it break the app
+    }
+  });
 }
 
-// each icon path is sent once, and again when it changes (the app's icon was updated)
-const iconsSent = new Map<string, string>();
-const sendIcon = (name: string, icon: string): boolean => {
-  if (iconsSent.get(name) === icon) return false;
-  iconsSent.set(name, icon);
-  return true;
-};
+// Only the page can confirm it got an icon; a push before its listener runs
+// must not suppress the next copy.
+const iconsSent = new Map<string, number>();
+const withUncachedIcon = (app: TopApp): TopApp =>
+  app.iconRevision && iconsSent.get(app.bundle || app.name) === app.iconRevision
+    ? { ...app, icon: undefined }
+    : app;
 
 function topApps(period: Period = appsPeriod): AppsPayload {
-  const apps = appTracker!
-    .top(getSettings().topApps, period)
-    .map((a) => (a.icon && sendIcon(a.name, a.icon) ? a : { ...a, icon: undefined }));
+  const apps = (appTracker?.top(getSettings().topApps, period) ?? []).map(withUncachedIcon);
   return { period, apps };
 }
-// stats for the popover (7 / 30 / 90 days); the top app's icon is sent once like the list's
+// stats can be queried as soon as the hidden page mounts, while the tracker is loading
 function statsPayload(days: StatsRange): Stats {
-  const stats = appTracker!.stats(days);
-  if (stats.topApp?.icon && !sendIcon(stats.topApp.name, stats.topApp.icon)) {
-    stats.topApp.icon = undefined;
-  }
-  return stats;
+  const stats = appTracker?.stats(days);
+  if (!stats)
+    return { days: [], totals: { down: 0, up: 0 }, busiest: null, topApp: null, avgPerDay: 0 };
+  return { ...stats, topApp: stats.topApp ? withUncachedIcon(stats.topApp) : null };
 }
 
 let latest: Traffic = { down: 0, up: 0 }; // bytes/s
@@ -278,12 +305,17 @@ let latest: Traffic = { down: 0, up: 0 }; // bytes/s
 // exactly the bytes moved in between, and the interface counters are cumulative. Real
 // traffic while "offline" makes the app re-read the state, in case a notice was missed.
 let online = true;
+let asleep = false;
+let counterEpoch = 0; // an interface read begun before sleep is stale after wake
+let quitting = false;
 let network: NetworkWatcher | undefined;
 let tickTimer: ReturnType<typeof setTimeout> | undefined;
 let ticking = false;
 let tick: () => Promise<void> = async () => {}; // set in init, once the counters are read
 
 function setOnline(next: boolean, why: string): void {
+  if (quitting) return;
+  next &&= !asleep;
   if (next === online) return;
   online = next;
   console.log(`tor: ${next ? "online" : "offline"} (${why})`);
@@ -296,13 +328,15 @@ function setOnline(next: boolean, why: string): void {
 
 function scheduleTick(delayMs = online ? INTERVAL_MS : OFFLINE_INTERVAL_MS): void {
   clearTimeout(tickTimer);
-  tickTimer = setTimeout(() => void tick(), delayMs);
+  if (!asleep && !quitting) tickTimer = setTimeout(() => void tick(), delayMs);
 }
 
 // `history` holds one sample per second (buckets() counts on it), so a reading that
 // spans several seconds (the offline interval, a wake from sleep) is spread over them
 function record(down: number, up: number, secs: number, now: number): void {
-  const n = Math.min(Math.max(1, Math.round(secs)), HISTORY_S);
+  // a 10 s offline poll is spread so the chart doesn't spike; a sleep of
+  // minutes must not paint that blip across the whole half hour
+  const n = secs > 30 ? 1 : Math.min(Math.max(1, Math.round(secs)), 10);
   for (let i = n - 1; i >= 0; i--) history.push({ t: now - i * 1000, down: down / n, up: up / n });
   if (history.length > HISTORY_S) history.splice(0, history.length - HISTORY_S);
 }
@@ -310,21 +344,50 @@ function record(down: number, up: number, secs: number, now: number): void {
 function snapshot(): Snapshot {
   return {
     rate: latest,
-    today: appTracker?.stats(1).totals ?? { down: 0, up: 0 },
+    today: appTracker?.todayTotals() ?? { down: 0, up: 0 },
     series: series(),
   };
 }
 
 let popoverOpen = false;
-let opening = false; // a click while the page is being prepared is ignored
+let opening = false; // a click while the page is being prepared cancels it
+let popoverPage = "home"; // only the home page needs the live app list
+let openGen = 0; // a ready event from the previous open must not resolve this one
+let shownAt = 0;
 let resolveReady: (() => void) | undefined;
+
+const PNG_MAGIC = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+const MAX_PNG_B64 = 400_000;
+function decodePng(png: unknown): Uint8Array | null {
+  if (typeof png !== "string" || png.length === 0 || png.length > MAX_PNG_B64) return null;
+  let bin: string;
+  try {
+    bin = atob(png);
+  } catch {
+    return null;
+  }
+  if (bin.length < 33 || bin.length > 256_000 || bin.slice(12, 16) !== "IHDR") return null;
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  if (!PNG_MAGIC.every((b, i) => out[i] === b)) return null;
+  const header = new DataView(out.buffer);
+  const width = header.getUint32(16);
+  const height = header.getUint32(20);
+  if (header.getUint32(8) !== 13 || width === 0 || width > 512 || height === 0 || height > 128)
+    return null;
+  return out;
+}
 // how long to wait for the page before showing the window anyway
 const READY_TIMEOUT_MS = 1500;
 let popoverFocused = false; // blur only counts after the window actually gained focus
 let closedAt = 0; // a click on the tray icon blurs (hides) the popover first
 
 function hidePopover(app: TinyApp): void {
+  openGen++; // the in-flight open sees this and does not show
+  resolveReady?.();
+  resolveReady = undefined;
   popoverOpen = false;
+  opening = false;
   popoverFocused = false;
   closedAt = Date.now();
   // go back to the home page while hidden, so reopening never shows the old page
@@ -333,18 +396,19 @@ function hidePopover(app: TinyApp): void {
 }
 
 async function togglePopover(app: TinyApp): Promise<void> {
-  if (popoverOpen) return hidePopover(app);
+  if (quitting || !appTracker) return;
+  if (popoverOpen || opening) return hidePopover(app);
   if (Date.now() - closedAt < 250) return; // that click is what just closed it
-  if (opening) return;
   opening = true;
+  const gen = ++openGen;
   try {
-    await openPopover(app);
+    await openPopover(app, gen);
   } finally {
-    opening = false;
+    if (gen === openGen) opening = false;
   }
 }
 
-async function openPopover(app: TinyApp): Promise<void> {
+async function openPopover(app: TinyApp, gen: number): Promise<void> {
   const win = app.window(POPOVER.id);
   // Open on the display that was clicked. tray.position() reports one display's
   // icon only (the built-in one), so on another display fall back to the cursor.
@@ -353,6 +417,7 @@ async function openPopover(app: TinyApp): Promise<void> {
     app.mousePosition(),
     app.screens(),
   ]);
+  if (gen !== openGen || quitting || !screens.length) return;
   const screen = screens.find((s) => s.id === mouse.screen.id) ?? screens[0];
   const rectOnScreen =
     rect &&
@@ -373,7 +438,7 @@ async function openPopover(app: TinyApp): Promise<void> {
   });
   win.push("stats", snapshot());
   win.push("apps", topApps());
-  win.push("reset"); // also puts the page back on home, scrolled to the top
+  win.push("reset", { generation: gen });
   let timer: ReturnType<typeof setTimeout> | undefined;
   await Promise.race([
     ready,
@@ -382,42 +447,75 @@ async function openPopover(app: TinyApp): Promise<void> {
     }),
   ]);
   clearTimeout(timer);
+  if (gen !== openGen) return; // hidden again while the page was getting ready
   resolveReady = undefined;
   popoverFocused = false;
   popoverOpen = true;
+  shownAt = Date.now();
   win.show();
 }
 
 export async function init(app: TinyApp): Promise<void> {
   const tempDir = (await app.paths()).temp;
   const dir = await tjs.makeTempDir(`${tempDir}/tor-icon-XXXXXX`);
+  iconTempDir = dir;
   await loadSettings(app);
   await loadUpdateState(app);
   let iconSeq = 0;
-  let requestedIcon = ""; // iconKey of the icon last asked of the page
+  let iconToken = 0;
+  let rendererReady = false;
+  let displayedKey = "";
+  let desired: { options: IconOptions; key: string } | undefined;
+  let inFlight: { token: number; key: string; writing?: true } | undefined;
+  const writtenIcons: string[] = [];
   const tray = { primaryAction: true, menu: [{ id: "quit", label: "Quit Tor" }], tooltip: "Tor" };
   app.tray.set({ ...tray, title: "Tor" }); // until the page has drawn the first icon
 
   // The page draws the icon (src/lib/trayIcon.ts) and sends it back as a PNG.
+  function dispatchTray(): void {
+    if (quitting || !rendererReady || !desired || inFlight || displayedKey === desired.key) return;
+    inFlight = { token: ++iconToken, key: desired.key };
+    app.window(POPOVER.id).push("draw-tray-icon", { ...desired.options, token: inFlight.token });
+  }
   async function setTray() {
     const options = trayOptions();
-    const key = iconKey(options);
-    if (key === requestedIcon) return; // that image is up, or on its way: nothing to draw
-    requestedIcon = key;
-    app.window(POPOVER.id).push("draw-tray-icon", options);
+    desired = { options, key: iconKey(options) };
+    dispatchTray();
   }
   trayIcons = {
-    async set(png) {
-      const path = `${dir}/icon-${iconSeq++ % 2}.png`; // alternate names: no icon caching
-      await tjs.writeFile(
-        path,
-        Uint8Array.from(atob(png), (c) => c.charCodeAt(0)),
-      );
-      app.tray.set({ ...tray, icon: path, template: false });
+    async set(png, token) {
+      const job = inFlight;
+      if (!job || token !== job.token || job.writing || quitting) return;
+      job.writing = true;
+      try {
+        const bytes = decodePng(png);
+        if (!bytes) return;
+        const path = `${dir}/icon-${iconSeq++}.png`;
+        await tjs.writeFile(path, bytes);
+        if (job !== inFlight || quitting) {
+          await tjs.remove(path).catch(() => {});
+          return;
+        }
+        // Always display a completed frame, even if the desired rate has
+        // changed. Keep only the newest desired frame behind this one.
+        app.tray.set({ ...tray, icon: path, template: false });
+        displayedKey = job.key;
+        writtenIcons.push(path);
+        if (writtenIcons.length > 3) tjs.remove(writtenIcons.shift()!).catch(() => {});
+      } catch (err) {
+        console.error("tor tray:", err);
+      } finally {
+        if (job === inFlight) {
+          inFlight = undefined;
+          if (desired?.key !== job.key) dispatchTray();
+        }
+      }
     },
     reset() {
-      requestedIcon = "";
-      return setTray();
+      rendererReady = true;
+      inFlight = undefined;
+      displayedKey = "";
+      void setTray();
     },
   };
   repaintTray = setTray;
@@ -441,49 +539,76 @@ export async function init(app: TinyApp): Promise<void> {
   // stay above other apps' windows until hidden: a normal-level panel can drop behind the app that just took focus
   app.window(POPOVER.id).setLevel("floating");
 
-  const usageDb = openUsageDb(`${(await app.paths()).data}/usage.db`);
-  await importLegacyUsage(app, usageDb);
+  const db = openUsageDb(`${(await app.paths()).data}/usage.db`);
+  usageDb = db;
+  await importLegacyUsage(app, db);
   const keepFrom = new Date(Date.now() - 89 * 86_400_000);
-  online = await isOnline().catch(() => true); // no answer: assume online and count
+  const initiallyOnline = await isOnline().catch(() => true);
+  online = initiallyOnline && !asleep;
   const logFile = `${(await app.paths()).logs}/tor.log`;
-  appTracker = await createAppTracker(tempDir, usageDb.load(localDay(keepFrom)), {
+  appTracker = await createAppTracker(tempDir, db.load(localDay(keepFrom)), {
     paused: !online,
-    isIgnored: (name) => getSettings().ignoredApps.includes(name),
+    isIgnored: (name, bundle) => isIgnoredApp(getSettings().ignoredApps, name, bundle),
     iconDir: `${(await app.paths()).data}/icons`,
-    onProblem: (message) => void appendLog(logFile, message),
+    onProblem: (message) => appendLog(logFile, message),
   });
+  if (asleep) appTracker.pause();
   // persist per-day app totals (7d / 30d history) every 30 s when they changed
   const flushUsage = (): void => {
-    const dirty = appTracker!.takeDirty();
-    if (dirty) usageDb.save(dirty.rows, dirty.pruneBefore, dirty.remove);
+    try {
+      appTracker?.flushDirty((rows, cutoff, removed) => db.save(rows, cutoff, removed));
+    } catch (err) {
+      appendLog(logFile, `could not save usage history: ${String(err)}`);
+    }
   };
-  setInterval(flushUsage, 30_000);
-  flushUsageOnQuit = flushUsage;
-  // top apps refresh every 500 ms while the popover is open
   setInterval(() => {
-    if (popoverOpen) app.window(POPOVER.id).push("apps", topApps());
+    if (!quitting) flushUsage();
+  }, 30_000);
+  flushUsageOnQuit = flushUsage;
+  // top apps refresh every 500 ms while the home page is showing
+  let lastFrame = "";
+  setInterval(() => {
+    if (!popoverOpen || popoverPage !== "home") {
+      lastFrame = "";
+      return;
+    }
+    const frame = topApps();
+    const key = JSON.stringify([frame.period, frame.apps.map(({ icon: _icon, ...row }) => row)]);
+    if (key === lastFrame && !frame.apps.some((a) => a.icon)) return;
+    lastFrame = key;
+    app.window(POPOVER.id).push("apps", frame);
   }, 500);
 
   startCheckingForUpdates(app, pushUpdateStatus(app));
 
-  let prev = await readCounters();
+  let prev: Awaited<ReturnType<typeof readCounters>> | null = null;
   let prevAt = Date.now();
+  let prevEpoch = counterEpoch;
+  let tunnelUntil = 0;
 
   tick = async () => {
-    if (ticking) return; // asked for while one runs: that one reschedules when it ends
+    if (ticking || asleep || quitting) return;
     ticking = true;
+    const epoch = counterEpoch;
     try {
       const cur = await readCounters();
+      if (epoch !== counterEpoch || quitting) return;
       const now = Date.now();
       const secs = Math.max((now - prevAt) / 1000, 0.001);
-      // counters can reset (sleep/reboot): clamp negative deltas to 0
-      const down = Math.max(0, cur.rx - prev.rx); // bytes since the previous reading
-      const up = Math.max(0, cur.tx - prev.tx);
+      const baseline = prevEpoch === epoch ? prev : null;
+      const { down, up, tunnel } = baseline
+        ? counterDelta(baseline, cur)
+        : { down: 0, up: 0, tunnel: 0 };
       prev = cur;
       prevAt = now;
-      record(down, up, secs, now);
+      prevEpoch = epoch;
+      if (baseline) record(down, up, secs, now);
+      else tunnelUntil = 0;
       latest = { down: down / secs, up: up / secs };
-      if (!online && down + up > OFFLINE_REFRESH_BYTES) void network?.refresh();
+      if (tunnel > 0) tunnelUntil = now + 30_000;
+      appTracker?.setTunnelActive(now < tunnelUntil);
+      // Power Nap keeps a primary interface. Don't resume nettop until wake.
+      if (!online && !asleep && down + up > OFFLINE_REFRESH_BYTES) void network?.refresh();
       await setTray();
       // a hidden webview is throttled, so a push per second would pile up behind it and
       // delay the next open: send only while the popover is showing (opening sends a fresh one)
@@ -495,27 +620,44 @@ export async function init(app: TinyApp): Promise<void> {
       scheduleTick();
     }
   };
-  scheduleTick();
+  scheduleTick(0);
   network = watchNetwork((up) => setOnline(up, up ? "network up" : "network down"));
 }
 
 // Asleep nothing moves, so nettop stops. Awake, the state is read right away rather than
 // waited for: a wired interface can keep its keys through sleep and never notify.
 export function onSystem(kind: string): void {
-  if (kind === "sleep") setOnline(false, "sleep");
-  else if (kind === "wake") void network?.refresh();
+  if (kind === "sleep" && !asleep) {
+    asleep = true;
+    counterEpoch++;
+    latest = { down: 0, up: 0 };
+    clearTimeout(tickTimer);
+    setOnline(false, "sleep");
+  } else if (kind === "wake" && asleep) {
+    asleep = false;
+    scheduleTick(0);
+    void network?.refresh();
+  }
 }
 
-function quitTor(app: TinyApp): void {
-  flushUsageOnQuit?.();
-  appTracker?.stop();
+async function quitTor(app: TinyApp): Promise<void> {
+  if (quitting) return;
+  quitting = true;
+  clearTimeout(tickTimer);
+  hidePopover(app);
   network?.stop();
-  app.quit();
+  try {
+    flushUsageOnQuit?.();
+    usageDb?.close();
+  } finally {
+    await Promise.allSettled([appTracker?.stop(), iconTempDir && tjs.remove(iconTempDir)]);
+    app.quit();
+  }
 }
 
 export async function onTray(id: string | null, app: TinyApp): Promise<void> {
   if (id === "quit") {
-    quitTor(app);
+    await quitTor(app);
   } else if (id === null) void togglePopover(app);
 }
 
@@ -523,5 +665,7 @@ export async function onTray(id: string | null, app: TinyApp): Promise<void> {
 export function onWindowState(info: TinyWindowStateEvent, app: TinyApp): void {
   if (info.win !== POPOVER.id) return;
   if (info.focused) popoverFocused = true;
-  else if (popoverFocused && popoverOpen) hidePopover(app);
+  // a panel that never receives focus still blurs when the user clicks away,
+  // once the click that opened it has had a moment
+  else if (popoverOpen && (popoverFocused || Date.now() - shownAt > 400)) hidePopover(app);
 }

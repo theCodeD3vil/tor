@@ -1,6 +1,6 @@
 import { useQuery } from "@tanstack/vue-query";
 import { computed, type Ref } from "vue";
-import type { Stats, StatsRange } from "../../shared/types";
+import { appId, type Stats, type StatsRange } from "../../shared/types";
 import { useTrafficStore } from "@/stores/traffic";
 
 // Stats for the last 7 / 30 / 90 days (daily totals, top app, busiest day…) from the backend's SQLite
@@ -24,7 +24,7 @@ export function useStats(days: Ref<StatsRange>) {
     const peak = Math.max(1, ...data.days.map((d) => d.down + d.up));
     return {
       ...data,
-      topApp: data.topApp ? { ...data.topApp, icon: traffic.icons[data.topApp.name] } : null,
+      topApp: data.topApp ? { ...data.topApp, icon: traffic.icons[appId(data.topApp)] } : null,
       // each bar is the day's total traffic, split into upload (top) and download (below)
       bars: data.days.map((d) => {
         const total = d.down + d.up;

@@ -45,20 +45,27 @@ interface TextLayout {
   unitW: number; // the widest unit of the current mode
 }
 
+const layoutCache = new Map<string, TextLayout>();
+
 function textLayout(ctx: CanvasRenderingContext2D, px: number, units: string[]): TextLayout {
+  const key = `${px}\0${units.join("\0")}`;
+  const cached = layoutCache.get(key);
+  if (cached) return cached;
   const width = (s: string, weight: number): number => {
     ctx.font = `${weight} ${px}px ${FONT}`;
     return Math.ceil(ctx.measureText(s).width);
   };
   const digitW = Math.max(..."0123456789".split("").map((d) => width(d, DIGIT_WEIGHT)));
   const pointW = width(".", DIGIT_WEIGHT);
-  return {
+  const layout = {
     digitW,
     pointW,
     numberW: 3 * digitW + pointW,
     spaceW: Math.round(px * 0.3),
     unitW: Math.max(...units.map((u) => width(u, UNIT_WEIGHT))),
   };
+  layoutCache.set(key, layout);
+  return layout;
 }
 
 function drawValue(
@@ -119,12 +126,14 @@ function drawArrow(ctx: CanvasRenderingContext2D, x: number, dir: "down" | "up",
   ctx.stroke();
 }
 
+const logo = new Path2D(LOGO_PATH);
+
 function drawLogo(ctx: CanvasRenderingContext2D): void {
   ctx.save();
   ctx.translate(PAD, Math.round((H - LOGO_SIZE) / 2));
   ctx.scale(LOGO_SIZE / LOGO_VIEWBOX, LOGO_SIZE / LOGO_VIEWBOX);
   ctx.fillStyle = TEXT_COLOR;
-  ctx.fill(new Path2D(LOGO_PATH));
+  ctx.fill(logo);
   ctx.restore();
 }
 
@@ -153,10 +162,11 @@ function iconWidth({ icon, arrows, offline }: IconOptions): number {
   return offline ? own || DOT_SIZE : own; // "none" gets a slot of its own for the dot
 }
 
+const canvas = document.createElement("canvas");
+const ctx = canvas.getContext("2d")!;
+
 function draw(options: IconOptions): HTMLCanvasElement {
   const { icon, values, units, colors, offline } = options;
-  const canvas = document.createElement("canvas");
-  const ctx = canvas.getContext("2d")!;
   const text = values.length > 1 ? STACKED : SINGLE;
   const layout = textLayout(ctx, text.px, units);
   const iconW = iconWidth(options);
@@ -192,16 +202,18 @@ async function toPngBase64(canvas: HTMLCanvasElement): Promise<string> {
     canvas.toBlob((b) => (b ? resolve(b) : reject(new Error("canvas: no PNG"))), "image/png"),
   );
   const png = new Blob([blob.slice(0, AFTER_IHDR), PHYS_144_DPI, blob.slice(AFTER_IHDR)]);
-  const dataUrl = await new Promise<string>((resolve) => {
+  const dataUrl = await new Promise<string>((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = () => resolve(reader.result as string);
+    reader.onerror = () => reject(reader.error ?? new Error("tray icon could not be read"));
+    reader.onabort = () => reject(new Error("tray icon read was aborted"));
     reader.readAsDataURL(png);
   });
   return dataUrl.slice(dataUrl.indexOf(",") + 1);
 }
 
 // ── wiring ──
-export async function renderTrayIcon(options: IconOptions): Promise<string> {
+async function renderTrayIcon(options: IconOptions): Promise<string> {
   return toPngBase64(draw(options));
 }
 
@@ -209,15 +221,22 @@ export async function renderTrayIcon(options: IconOptions): Promise<string> {
 export function startTrayIconRenderer(): void {
   const tiny = window.tiny;
   if (!tiny) return;
-  let queue = Promise.all([
+  const fonts = Promise.allSettled([
     document.fonts.load(`${DIGIT_WEIGHT} 20px ${FONT}`),
     document.fonts.load(`${UNIT_WEIGHT} 20px ${FONT}`),
-  ]).then(() => {});
-  tiny.api.on("draw-tray-icon", (options: IconOptions) => {
-    queue = queue
-      .then(async () => tiny.api.call("setTrayIcon", { png: await renderTrayIcon(options) }))
-      .catch((err) => console.error("tray icon:", err));
+  ]);
+  tiny.api.on("draw-tray-icon", (options: IconOptions & { token?: number }) => {
+    // The backend sends only one request at a time and waits for this reply.
+    void (async () => {
+      let png: string | null = null;
+      try {
+        png = await renderTrayIcon(options);
+      } catch (err) {
+        console.error("tray icon:", err);
+      }
+      await tiny.api.call("setTrayIcon", { png, token: options.token });
+    })().catch((err) => console.error("tray icon reply:", err));
   });
   // a fresh page (launch, reload) has drawn nothing yet: ask for the current icon
-  void queue.then(() => tiny.api.call("trayIconReady"));
+  void fonts.then(() => tiny.api.call("trayIconReady"));
 }

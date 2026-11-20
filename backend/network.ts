@@ -7,6 +7,7 @@
 // closing the writer sends no EOF, so the one-shot goes through `sh` and the watcher's
 // write is not awaited.
 
+const SCUTIL = "/usr/sbin/scutil";
 const KEYS = ["State:/Network/Global/IPv4", "State:/Network/Global/IPv6"];
 const SETTLE_MS = 300; // one change arrives as a few notifications: read the state once
 const encoder = new TextEncoder();
@@ -20,13 +21,14 @@ export interface NetworkWatcher {
 /** true when a primary interface exists, for IPv4 or IPv6 */
 export async function isOnline(): Promise<boolean> {
   const script = KEYS.map((key) => `show ${key}`).join("\\n");
-  const proc = tjs.spawn(["sh", "-c", `printf '${script}\\n' | scutil`], {
+  const proc = tjs.spawn(["/bin/sh", "-c", `printf '${script}\\n' | ${SCUTIL}`], {
     stdin: "ignore",
     stdout: "pipe",
     stderr: "ignore",
   });
   const out = await proc.stdout!.text();
-  await proc.wait();
+  const status = await proc.wait();
+  if (status.exit_status !== 0) throw new Error("scutil failed to read network state");
   return /PrimaryInterface\s*:/.test(out);
 }
 
@@ -34,6 +36,7 @@ export function watchNetwork(onState: (online: boolean) => void): NetworkWatcher
   let stopped = false;
   let proc: ReturnType<typeof tjs.spawn> | undefined;
   let settle: ReturnType<typeof setTimeout> | undefined;
+  let restart: ReturnType<typeof setTimeout> | undefined;
   let again = false;
   let reading: Promise<void> | null = null;
 
@@ -44,7 +47,8 @@ export function watchNetwork(onState: (online: boolean) => void): NetworkWatcher
       while (again && !stopped) {
         again = false;
         try {
-          onState(await isOnline());
+          const online = await isOnline();
+          if (!stopped && !again) onState(online);
         } catch (err) {
           console.error("tor network:", err); // the state stays as it was
         }
@@ -56,20 +60,32 @@ export function watchNetwork(onState: (online: boolean) => void): NetworkWatcher
   }
 
   async function watch(): Promise<void> {
-    const p = tjs.spawn(["scutil"], { stdin: "pipe", stdout: "pipe", stderr: "ignore" });
+    const p = tjs.spawn([SCUTIL], { stdin: "pipe", stdout: "pipe", stderr: "ignore" });
     proc = p;
     // stdin stays open: EOF would end the session (not awaited, see above)
     const commands = `${KEYS.map((key) => `n.add ${key}\n`).join("")}n.watch\n`;
-    void p.stdin!.getWriter().write(encoder.encode(commands));
+    const writer = p.stdin!.getWriter();
+    void writer.write(encoder.encode(commands)).catch(() => {});
     const reader = p.stdout!.getReader();
-    for (;;) {
-      const { done } = await reader.read();
-      if (done) break;
-      // whatever it printed is a change notice: `show` replies go to their own process
-      clearTimeout(settle);
-      settle = setTimeout(() => void refresh(), SETTLE_MS);
+    try {
+      for (;;) {
+        const { done } = await reader.read();
+        if (done) break;
+        // whatever it printed is a change notice: `show` replies go to their own process
+        clearTimeout(settle);
+        settle = setTimeout(() => void refresh(), SETTLE_MS);
+      }
+    } finally {
+      // release the lock when scutil exits; closing the writer would send EOF
+      // and end the session on the next start
+      try {
+        writer.releaseLock();
+      } catch {
+        // the stream is already closed
+      }
+      reader.releaseLock();
+      if (proc === p) proc = undefined;
     }
-    if (proc === p) proc = undefined;
   }
 
   function start(): void {
@@ -80,19 +96,21 @@ export function watchNetwork(onState: (online: boolean) => void): NetworkWatcher
         // scutil ended (killed, or its store connection dropped): start over, and read
         // the state in case it changed in between
         if (!stopped)
-          setTimeout(() => {
+          restart = setTimeout(() => {
             start();
             void refresh();
           }, 1000);
       });
   }
   start();
+  void refresh();
 
   return {
     refresh,
     stop() {
       stopped = true;
       clearTimeout(settle);
+      clearTimeout(restart);
       try {
         proc?.kill();
       } catch {

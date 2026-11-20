@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import { iconURL } from "@/stores/traffic";
+import AppIcon from "@/components/AppIcon.vue";
 import { IconDeviceDesktop, IconMoon, IconSun, IconX } from "@tabler/icons-vue";
 import { useQuery, useQueryClient } from "@tanstack/vue-query";
-import type { TopApp } from "../../shared/types";
+import { appId, type TopApp } from "../../shared/types";
 import { computed } from "vue";
 import type {
   ColorId,
@@ -37,28 +38,44 @@ const queryClient = useQueryClient();
 
 // the hidden apps with their icons; refetched when the list changes
 const ignored = useQuery({
-  queryKey: computed(() => ["ignored-apps", store.settings.ignoredApps.join("|")]),
+  queryKey: computed(() => ["ignored-apps", store.settings.ignoredApps.map(appId)]),
   queryFn: async () =>
     ((await window.tiny.api.call("getIgnoredApps")) as TopApp[]).map((a) => ({
       ...a,
       icon: a.icon ? iconURL(a.icon) : a.icon,
     })),
   staleTime: 1_000,
-  // icons load in the background: ask again while any is missing
-  refetchInterval: (query) => (query.state.data?.some((a) => !a.icon) ? 1_000 : false),
+  // icons load in the background. An app with no bundle (opencode) never has
+  // one, and a missing bundle is not worth polling forever.
+  refetchInterval: (query) => {
+    const waiting = query.state.data?.some((a) => a.bundle && !a.icon);
+    if (!waiting) return false;
+    // Count completed fetches for this query, not evaluations of the callback.
+    return query.state.dataUpdateCount < 6 ? 1_000 : false;
+  },
+});
+
+const duplicateIgnoredNames = computed(() => {
+  const seen = new Set<string>();
+  const duplicates = new Set<string>();
+  for (const app of store.settings.ignoredApps) {
+    if (seen.has(app.name)) duplicates.add(app.name);
+    seen.add(app.name);
+  }
+  return duplicates;
 });
 
 // an app shown again counts in the list and the totals at once
-const showApp = async (name: string): Promise<void> => {
-  await store.unignoreApp(name);
+const showApp = async (app: TopApp): Promise<void> => {
+  await store.unignoreApp(appId(app));
   await queryClient.invalidateQueries({ queryKey: ["top-apps"] });
   await queryClient.invalidateQueries({ queryKey: ["stats"] });
 };
 
 // the button doubles as the status: what the last check found
 const checkLabel = computed(() => {
-  if (updates.isChecking.value) return "Checking…";
-  switch (updates.status.data.value?.state) {
+  if (updates.isChecking) return "Checking…";
+  switch (updates.status.data?.state) {
     case "up-to-date":
       return "Up to date";
     case "error":
@@ -239,31 +256,26 @@ const valueOptions: { value: MenubarValue; label: string }[] = [
       <div
         v-for="app in ignored.data.value ?? []"
         v-else
-        :key="app.name"
+        :key="appId(app)"
         class="flex items-center gap-2.5 px-4 py-2.5"
       >
-        <img
-          v-if="app.icon"
-          :src="app.icon"
-          alt=""
-          class="size-7 shrink-0 rounded-md"
-          draggable="false"
-        />
-        <div
-          v-else
-          class="flex size-7 shrink-0 items-center justify-center rounded-md bg-foreground/10 text-xs font-semibold"
-        >
-          {{ app.name.slice(0, 1) }}
+        <AppIcon :name="app.name" :src="app.icon" class="size-7 rounded-md" />
+        <div class="min-w-0 flex-1">
+          <p class="truncate text-sm font-medium text-foreground/90">{{ app.name }}</p>
+          <p
+            v-if="duplicateIgnoredNames.has(app.name) && app.bundle"
+            class="truncate text-xs text-muted-foreground"
+            :title="app.bundle"
+          >
+            {{ app.bundle }}
+          </p>
         </div>
-        <span class="min-w-0 flex-1 truncate text-sm font-medium text-foreground/90">
-          {{ app.name }}
-        </span>
         <Button
           variant="ghost"
           size="icon-sm"
           :aria-label="`Show ${app.name} again`"
           :title="`Show ${app.name} again`"
-          @click="showApp(app.name)"
+          @click="showApp(app)"
         >
           <IconX class="size-4" />
         </Button>
@@ -276,14 +288,14 @@ const valueOptions: { value: MenubarValue; label: string }[] = [
       <SettingsField>
         <template #label>Check for updates</template>
         <!-- opens the update page (release notes), where the install button lives -->
-        <Button v-if="updates.available.value" size="sm" @click="emit('openUpdate')">
+        <Button v-if="updates.available" size="sm" @click="emit('openUpdate')">
           Download update
         </Button>
         <Button
           v-else
           variant="outline"
           size="sm"
-          :disabled="updates.isChecking.value || updates.status.data.value?.state === 'unsupported'"
+          :disabled="updates.isChecking || updates.status.data?.state === 'unsupported'"
           @click="updates.check()"
         >
           {{ checkLabel }}

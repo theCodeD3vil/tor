@@ -1,5 +1,6 @@
 // User settings, shared by the backend (which persists them and draws the menubar
 // icon from them) and the popover page (which edits them).
+import { appId } from "./types";
 
 export type SpeedUnit = "MBps" | "Mbps";
 export type ThemeMode = "light" | "dark" | "system";
@@ -26,6 +27,13 @@ export const COLOR_PRESETS = [
 ] as const;
 export type ColorId = (typeof COLOR_PRESETS)[number]["id"];
 
+export interface IgnoredApp {
+  name: string;
+  bundle: string;
+  /** Older settings sometimes had only a display name. */
+  legacyName?: true;
+}
+
 export interface Settings {
   unit: SpeedUnit;
   topApps: TopAppsCount;
@@ -37,8 +45,8 @@ export interface Settings {
   /** look for updates on a schedule; off = only when asked */
   autoUpdates: boolean;
   updateFrequency: UpdateFrequency;
-  /** app names left out of Top apps and the totals (a VPN, a backup tool…); still recorded */
-  ignoredApps: string[];
+  /** Apps left out of Top apps and the totals; still recorded. */
+  ignoredApps: IgnoredApp[];
 }
 
 export const defaultSettings: Settings = {
@@ -55,7 +63,9 @@ export const defaultSettings: Settings = {
 };
 
 const MAX_IGNORED = 100;
-const allowed: { [K in Exclude<keyof Settings, "ignoredApps">]: readonly Settings[K][] } = {
+const allowed: {
+  [K in Exclude<keyof Settings, "ignoredApps">]: readonly Settings[K][];
+} = {
   unit: ["MBps", "Mbps"],
   topApps: [5, 10, 20],
   theme: ["light", "dark", "system"],
@@ -76,12 +86,36 @@ export function pickSettings(input: unknown): Partial<Settings> {
     if ((allowed[key] as readonly unknown[]).includes(value)) picked[key] = value;
   }
   const ignored = (input as Record<string, unknown>).ignoredApps;
-  if (Array.isArray(ignored)) {
-    picked.ignoredApps = [
-      ...new Set(ignored.filter((n): n is string => typeof n === "string" && n.length <= 200)),
-    ].slice(0, MAX_IGNORED);
-  }
+  const bundles = (input as Record<string, unknown>).ignoredBundles;
+  if (Array.isArray(ignored)) picked.ignoredApps = pickIgnoredApps(ignored, bundles);
   return picked as Partial<Settings>;
+}
+
+function pickIgnoredApps(input: unknown[], bundles: unknown): IgnoredApp[] {
+  const picked = new Map<string, IgnoredApp>();
+  const old = bundles && typeof bundles === "object" ? (bundles as Record<string, unknown>) : {};
+  for (const value of input) {
+    if (picked.size >= MAX_IGNORED) break;
+    const raw =
+      typeof value === "string"
+        ? { name: value, bundle: Object.hasOwn(old, value) ? old[value] : "", legacyName: true }
+        : value;
+    if (!raw || typeof raw !== "object") continue;
+    const { name, bundle, legacyName } = raw as Record<string, unknown>;
+    if (typeof name !== "string" || !name || name.length > 200) continue;
+    if (typeof bundle !== "string" || (bundle && !bundle.startsWith("/")) || bundle.length > 4096)
+      continue;
+    const app: IgnoredApp = { name: !bundle && name === "opencode" ? "OpenCode" : name, bundle };
+    if (!bundle && legacyName === true) app.legacyName = true;
+    picked.set(appId(app), app);
+  }
+  return [...picked.values()];
+}
+
+export function isIgnoredApp(ignored: IgnoredApp[], name: string, bundle: string): boolean {
+  return ignored.some((app) =>
+    app.bundle ? app.bundle === bundle : app.name === name && (app.legacyName || !bundle),
+  );
 }
 
 export function colorHex(id: ColorId): string {
