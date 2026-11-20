@@ -266,7 +266,8 @@ function run(argv) {
 `;
 
 // Add an alias per installed terminal app for the server paths that run on its behalf.
-// Apps not installed are skipped: their servers cannot be running either.
+// Apps not installed are skipped: their servers cannot be running either. An agent's row
+// (AGENT_SERVICES) gets the bundle of its desktop app when that is installed.
 async function resolveAliases(dir: string): Promise<void> {
   const script = `${dir}/apppaths.jxa.js`;
   await tjs.writeFile(script, APP_PATHS_SCRIPT);
@@ -391,7 +392,8 @@ export async function createAppTracker(
   await tjs.makeDir(iconDir, { recursive: true });
   await resolveAliases(scriptDir);
   // History recorded under a server's own name before its alias existed ("Herdr Core",
-  // "Rex Server") is folded into the app it stands for, so the list shows one entry
+  // "Rex Server"), or under a row's earlier name ("opencode"), is folded into the app it
+  // stands for, so the list shows one entry
   for (const [day, apps] of Object.entries(daily)) {
     for (const [key, v] of Object.entries(apps)) {
       const previous = v.name || key;

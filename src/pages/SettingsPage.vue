@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { iconURL } from "@/stores/traffic";
 import AppIcon from "@/components/AppIcon.vue";
+import { bundledIcon } from "@/lib/bundledIcons";
 import { IconDeviceDesktop, IconMoon, IconSun, IconX } from "@tabler/icons-vue";
 import { useQuery, useQueryClient } from "@tanstack/vue-query";
 import { appId, type TopApp } from "../../shared/types";
@@ -45,10 +46,10 @@ const ignored = useQuery({
       icon: a.icon ? iconURL(a.icon) : a.icon,
     })),
   staleTime: 1_000,
-  // icons load in the background. An app with no bundle (opencode) never has
-  // one, and a missing bundle is not worth polling forever.
+  // Icons load in the background. Skip apps that already have a bundled logo,
+  // and cap polling for a missing bundle.
   refetchInterval: (query) => {
-    const waiting = query.state.data?.some((a) => a.bundle && !a.icon);
+    const waiting = query.state.data?.some((a) => a.bundle && !a.icon && !bundledIcon(a.name));
     if (!waiting) return false;
     // Count completed fetches for this query, not evaluations of the callback.
     return query.state.dataUpdateCount < 6 ? 1_000 : false;
