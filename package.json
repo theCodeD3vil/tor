@@ -9,9 +9,15 @@
     "preview": "vp preview",
     "prepare": "husky",
     "check": "vp check",
+    "test": "vp test",
     "fix": "vp check --fix",
     "fallow": "fallow",
     "fallow:health": "fallow health",
+    "release:key": "bun .github/scripts/create-update-key.mjs",
+    "release:certificate": "bun .github/scripts/create-signing-certificate.mjs",
+    "release:secrets": "bun .github/scripts/set-signing-secrets.mjs",
+    "release:github-settings": "bun .github/scripts/github-settings.mjs",
+    "release:publish": "bun .github/scripts/publish-release.mjs",
     "typecheck": "vue-tsc --noEmit"
   },
   "dependencies": {
@@ -22,6 +28,7 @@
     "@vueuse/core": "^15.0.0",
     "class-variance-authority": "^0.7.1",
     "cn": "^0.5.2",
+    "dompurify": "^3.4.18",
     "marked": "^18.1.3",
     "pinia": "^4.1.0",
     "reka-ui": "^2.11.0",
@@ -32,6 +39,8 @@
   },
   "devDependencies": {
     "@shadcn/lint": "^0.2.5",
+    "@types/dompurify": "^3.2.0",
+    "@types/node": "^22",
     "@vitejs/plugin-vue": "^6.0.10",
     "fallow": "^3.39.0",
     "husky": "^9.1.7",

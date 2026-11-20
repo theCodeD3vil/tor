@@ -5,12 +5,12 @@ import { useUpdates } from "@/composables/useUpdates";
 import { formatBytes } from "@/lib/format";
 
 const updates = useUpdates();
-const status = computed(() => updates.status.data.value);
+const status = computed(() => updates.status.data);
 
 // null = the server sent no size, so the bar can't show a fraction; until the first
 // bytes arrive the bar is simply empty rather than indeterminate
 const percent = computed(() => {
-  const p = updates.progress.value;
+  const p = updates.progress;
   if (!p) return null;
   if (p.total) return Math.min(100, Math.round((p.received / p.total) * 100));
   return p.received === 0 ? 0 : null;
@@ -24,13 +24,17 @@ const percent = computed(() => {
       <p class="text-xs text-muted-foreground">You have {{ status.current }}</p>
     </div>
 
-    <div v-if="updates.progress.value" class="grid gap-1.5 rounded-2xl bg-foreground/5 p-4">
+    <p v-if="updates.installError" role="alert" class="text-sm text-muted-foreground">
+      Tor couldn’t install the update. Try again or download it from the official release page.
+    </p>
+
+    <div v-if="updates.progress" class="grid gap-1.5 rounded-2xl bg-foreground/5 p-4">
       <div class="flex items-baseline justify-between text-xs text-muted-foreground tabular-nums">
         <span>Downloading…</span>
         <span>
-          {{ formatBytes(updates.progress.value.received) }}
-          <template v-if="updates.progress.value.total">
-            / {{ formatBytes(updates.progress.value.total) }}
+          {{ formatBytes(updates.progress.received) }}
+          <template v-if="updates.progress.total">
+            / {{ formatBytes(updates.progress.total) }}
           </template>
         </span>
       </div>

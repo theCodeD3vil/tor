@@ -42,7 +42,7 @@ const instant = ref(false);
 onMounted(() => {
   stopListening = traffic.listen();
   settingsStore.listen();
-  stopOpened = window.tiny?.api.on("reset", async () => {
+  stopOpened = window.tiny?.api.on("reset", async (request?: { generation: number }) => {
     instant.value = true;
     page.value = "home";
     await nextTick();
@@ -50,8 +50,9 @@ onMounted(() => {
     // next open never shows it scrolling
     for (const el of document.querySelectorAll<HTMLElement>(".page")) el.scrollTop = 0;
     instant.value = false;
+    void window.tiny?.api.call("setPage", { page: "home" });
     // tell the backend the page is up to date, so it can show the window
-    void window.tiny?.api.call("popoverReady");
+    if (request) void window.tiny?.api.call("popoverReady", request);
   });
 });
 onUnmounted(() => {
@@ -69,14 +70,16 @@ const cameFrom = ref<Page>("home");
 const direction = ref<"page-forward" | "page-back">("page-forward");
 const pageTransition = computed(() => (instant.value ? "page-instant" : direction.value));
 const go = (next: Page): void => {
+  if (next === page.value) return; // opening Update again must not point Back at itself
   if (next === "update") cameFrom.value = page.value;
   direction.value = DEPTH[next] > DEPTH[page.value] ? "page-forward" : "page-back";
   page.value = next;
+  void window.tiny?.api.call("setPage", { page: next });
 };
 const BACK: Record<Exclude<Page, "home">, () => Page> = {
   settings: () => "home",
   about: () => "settings",
-  update: () => cameFrom.value,
+  update: () => (cameFrom.value === "update" ? "home" : cameFrom.value),
 };
 const goBack = (): void => go(page.value === "home" ? "home" : BACK[page.value]());
 const PAGE_TITLES: Record<Exclude<Page, "home">, string> = {
@@ -107,8 +110,8 @@ const statsRangeLabel = computed(() =>
 const topUsage = computed(() => Math.max(1, ...apps.value.map((a) => a.down + a.up)));
 const queryClient = useQueryClient();
 // hide an app from the list and the totals; the cached lists and stats are stale at once
-const hideApp = async (name: string): Promise<void> => {
-  await settingsStore.ignoreApp(name);
+const hideApp = async (name: string, bundle = ""): Promise<void> => {
+  await settingsStore.ignoreApp(name, bundle);
   await queryClient.invalidateQueries({ queryKey: ["top-apps"] });
   await queryClient.invalidateQueries({ queryKey: ["stats"] });
 };
@@ -286,7 +289,7 @@ onUnmounted(() => {
               <TransitionGroup v-else tag="ul" name="app" class="relative flex flex-col gap-3.5">
                 <li
                   v-for="app in apps"
-                  :key="app.name"
+                  :key="app.bundle || app.name"
                   class="app-row group flex items-center gap-2.5"
                 >
                   <AppIcon :name="app.name" :src="app.icon" class="size-8 rounded-lg" />
@@ -301,7 +304,7 @@ onUnmounted(() => {
                           class="rounded p-0.5 opacity-0 transition-opacity hover:text-foreground focus-visible:opacity-100 group-hover:opacity-100"
                           :aria-label="`Hide ${app.name}`"
                           :title="`Hide ${app.name} from Top apps and totals`"
-                          @click="hideApp(app.name)"
+                          @click="hideApp(app.name, app.bundle)"
                         >
                           <IconEyeOff class="size-3.5" />
                         </button>
@@ -488,8 +491,12 @@ onUnmounted(() => {
           key="update"
           class="absolute inset-0 flex items-center justify-end px-4 pt-2"
         >
-          <Button size="sm" :disabled="updates.isInstalling.value" @click="updates.install()">
-            {{ updates.isInstalling.value ? "Installing…" : "Install and restart" }}
+          <Button
+            size="sm"
+            :disabled="updates.isInstalling || !updates.available"
+            @click="updates.install()"
+          >
+            {{ updates.isInstalling ? "Installing…" : "Install and restart" }}
           </Button>
         </div>
         <div v-else key="about" class="absolute inset-0" />
@@ -497,7 +504,7 @@ onUnmounted(() => {
       <!-- stays put while the pages slide; the update page has its own install button -->
       <Transition name="chrome">
         <button
-          v-if="updates.available.value && page !== 'update'"
+          v-if="updates.available && page !== 'update'"
           type="button"
           class="absolute inset-y-0 left-4 my-auto flex h-7 translate-y-1 items-center gap-1.5 rounded-full bg-download/20 px-2.5 text-xs font-medium text-download outline-none transition-colors hover:bg-download/30 focus-visible:ring-2 focus-visible:ring-ring"
           @click="go('update')"

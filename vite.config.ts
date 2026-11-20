@@ -43,5 +43,16 @@ export default defineConfig({
   resolve: {
     alias: { "@": fileURLToPath(new URL("./src", import.meta.url)) },
   },
-  plugins: lazyPlugins(() => [vue(), tailwindcss()]),
+  plugins: lazyPlugins(() => [
+    vue(),
+    tailwindcss(),
+    {
+      name: "dev-content-security-policy",
+      apply: "serve",
+      transformIndexHtml: (html, ctx) =>
+        ctx.server
+          ? html.replace("connect-src 'none'", "connect-src 'self' ws://127.0.0.1:5173")
+          : html,
+    },
+  ]),
 });

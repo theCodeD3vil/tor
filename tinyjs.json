@@ -4,7 +4,7 @@
   "title": "Tor",
   "size": "960x640",
   "id": "com.michael.tor",
-  "version": "0.1.13",
+  "version": "0.1.14",
   "backend": "backend/main.ts",
   "frontend": {
     "build": "bun run build",
@@ -12,10 +12,41 @@
     "dev": "bun run dev",
     "devUrl": "http://127.0.0.1:5173"
   },
-  "readAccess": true,
   "activation": "accessory",
   "mainWindow": false,
+  "downloads": "deny",
+  "popups": "deny",
+  "api": {
+    "enable": [
+      "openExternalLink",
+      "hidePopover",
+      "setAppsPeriod",
+      "setPage",
+      "quit",
+      "getSettings",
+      "updateSettings",
+      "getUpdateStatus",
+      "checkForUpdates",
+      "installUpdate",
+      "getVersion",
+      "getIgnoredApps",
+      "resetIcons",
+      "cacheIcons",
+      "popoverReady",
+      "getApps",
+      "getStats",
+      "setTrayIcon",
+      "trayIconReady",
+      "event.reset",
+      "event.stats",
+      "event.apps",
+      "event.update-status",
+      "event.update-progress",
+      "event.draw-tray-icon"
+    ]
+  },
   "update": {
-    "url": "https://github.com/theCodeD3vil/tor/releases/latest/download/manifest.json"
+    "url": "https://github.com/theCodeD3vil/tor/releases/latest/download/manifest.json",
+    "publicKey": "zTBvY+6OcOsV5xPAZqoPWSfewz34VipF8Phed2YEb6k="
   }
 }

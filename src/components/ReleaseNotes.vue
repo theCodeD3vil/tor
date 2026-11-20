@@ -1,19 +1,66 @@
 <script setup lang="ts">
+import DOMPurify from "dompurify";
 import { marked } from "marked";
 import { computed } from "vue";
 
 const props = defineProps<{ markdown: string }>();
 
-// The notes come from the same release manifest as the update itself, so
-// their HTML is as trusted as the download
-const html = computed(() => marked.parse(props.markdown, { async: false }));
+// Notes are the pull request body, which is not reviewed as code. marked
+// keeps raw HTML, so sanitize before v-html. The popover can call the
+// native bridge, and opening the update screen must not run that HTML.
+const html = computed(() =>
+  DOMPurify.sanitize(marked.parse(props.markdown, { async: false }) as string, {
+    ALLOWED_TAGS: [
+      "a",
+      "b",
+      "blockquote",
+      "br",
+      "code",
+      "del",
+      "em",
+      "h1",
+      "h2",
+      "h3",
+      "h4",
+      "h5",
+      "h6",
+      "hr",
+      "i",
+      "li",
+      "ol",
+      "p",
+      "pre",
+      "s",
+      "strong",
+      "table",
+      "tbody",
+      "td",
+      "th",
+      "thead",
+      "tr",
+      "ul",
+    ],
+    ALLOWED_ATTR: ["href", "title"],
+    ALLOW_ARIA_ATTR: false,
+    ALLOW_DATA_ATTR: false,
+    ALLOWED_URI_REGEXP: /^https:\/\//i,
+  }),
+);
 
-// A link would replace the popover, so open it in the browser instead
+// A link would replace the popover, so open it in the browser instead.
+// The backend independently validates the URL before handing it to macOS.
 function openLinkInBrowser(event: MouseEvent): void {
   const link = (event.target as HTMLElement).closest("a");
   if (!link) return;
   event.preventDefault();
-  void window.tiny?.app.shell.open(link.href);
+  let url: URL;
+  try {
+    url = new URL(link.href);
+  } catch {
+    return;
+  }
+  if (url.protocol !== "https:") return;
+  void window.tiny?.api.call("openExternalLink", { url: url.href });
 }
 </script>
 

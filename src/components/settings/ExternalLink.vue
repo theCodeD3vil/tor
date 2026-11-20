@@ -6,7 +6,14 @@ const props = defineProps<{ name: string; url: string }>();
 
 // opens in the default browser; the popover can't navigate away
 function openLink(): void {
-  void window.tiny?.app.shell.open(props.url);
+  let url: URL;
+  try {
+    url = new URL(props.url);
+  } catch {
+    return;
+  }
+  if (url.protocol !== "https:") return;
+  void window.tiny?.api.call("openExternalLink", { url: url.href });
 }
 </script>
 

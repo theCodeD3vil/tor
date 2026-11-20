@@ -10,7 +10,7 @@
   <a href="https://github.com/theCodeD3vil/tor/releases/latest"><strong>Download for macOS</strong></a>
 </p>
 
-Tor is a network traffic monitor for your Mac. It sits quietly in the menu bar, shows your live upload and download speed, and keeps a record of which apps use your data. Everything is measured and stored locally on your Mac. Nothing ever leaves.
+Tor is a network traffic monitor for your Mac. It sits quietly in the menu bar, shows your live upload and download speed, and keeps a record of which apps use your data. Usage stays on your Mac. Update checks and downloads contact GitHub.
 
 ## Installation
 
@@ -28,6 +28,8 @@ Tor runs on macOS, on both Apple Silicon and Intel Macs.
 
 Tor keeps itself up to date: when it starts, and then daily, weekly or monthly as you choose, it looks for a new version. When one is found, an **Update available** badge appears in the panel. Click it to read what's new and install. You can change the schedule, or turn automatic checks off, in **Settings › Updates**, and check any time with **Check now**.
 
+**Upgrading from Tor 0.1.13 or earlier:** Download the disk image from the [official releases page](https://github.com/theCodeD3vil/tor/releases/latest) and replace the old app. Those versions do not verify signed update manifests. Tor 0.1.14 and later require a valid signature on every in-app update. Replacing the app preserves your local usage history.
+
 ## Features
 
 - **Live speed in the menu bar.** The icon shows your current speed, updated every second. Choose what it shows in **Settings › Menubar**: the volume bars, arrows, the Tor logo or nothing, next to the download speed, the upload speed, both, today's total downloaded or uploaded, or the net total.
@@ -40,11 +42,16 @@ Tor keeps itself up to date: when it starts, and then daily, weekly or monthly a
 
 ## Good to know
 
-- **Apps are grouped under the app that started them.** Traffic from a program you run in a terminal counts toward the terminal app, and a browser's helper processes count toward the browser. The exception is OpenCode: its sessions share one background service, so it shows as its own entry, together with the OpenCode desktop app if you have it.
+- **Apps are grouped under the app that started them.** Traffic from a program you run in a terminal counts toward the terminal app, and a browser's helper processes count toward the browser. OpenCode’s desktop app and shared background service appear together as one entry.
 - **Only traffic that leaves your Mac is counted.** Connections between programs on your own Mac are ignored.
-- **VPNs are fine.** Apps are counted whether or not their traffic goes through a VPN, and the VPN's own tunnel isn't counted on top of them. If a VPN still shows up in Top apps, hide it.
+- **VPN totals are approximate.** Tor estimates which traffic belongs to the VPN itself to avoid counting it twice. If your VPN still shows up in Top apps, you can hide it.
+- **Tor is a usage monitor, not a security monitor.** macOS process attribution is best-effort; Tor isn't designed to detect or account for every process on a compromised Mac.
 - **History starts when you first open Tor.** Longer ranges fill up over time, up to 90 days.
 - **Totals and the app list only count while Tor is running.**
+
+## Releasing
+
+Tor uses [the same macOS draft, verification, and local signing process as Teneo](docs/release-process.md). Merging a version bump builds a GitHub draft. Publish it from the maintainer's Mac with `bun run release:publish`.
 
 ## Screenshots
 

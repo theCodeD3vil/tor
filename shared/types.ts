@@ -25,8 +25,17 @@ export interface Snapshot {
 /** `icon` is a data URL; the backend sends each one only once, so it is often absent */
 export interface TopApp extends Traffic {
   name: string;
-  /** PNG path on disk (the page loads it through tiny.fileURL); sent once, then left out */
+  /** .app bundle path when this row is a real app; empty for System & CLI and agents */
+  bundle?: string;
+  /** data URL, sent once, then left out */
   icon?: string | null;
+  /** identifies the icon contents so the page can acknowledge receiving them */
+  iconRevision?: number;
+}
+
+/** icon-cache and list identity: two bundles can share a display name */
+export function appId(app: { name: string; bundle?: string }): string {
+  return app.bundle || app.name;
 }
 
 /** pushed as the "apps" event and returned by getApps */
@@ -52,6 +61,8 @@ export interface Stats {
 /** day → app name → totals; what the SQLite history loads into memory */
 export interface AppEntry extends Traffic {
   bundle: string;
+  /** display name; absent on rows loaded before it was stored, where the map key is the name */
+  name?: string;
 }
 export type DailyUsage = Record<string, Record<string, AppEntry>>;
 

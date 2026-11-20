@@ -1,16 +1,16 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/vue-query";
-import { computed, onMounted, onUnmounted, ref } from "vue";
+import { defineStore } from "pinia";
+import { computed, onMounted, ref } from "vue";
 import type { UpdateProgress, UpdateStatus } from "../../shared/types";
 
 const KEY = ["update-status"];
 
-// shared, so the update page can show the bar while the footer button runs the install
-const progress = ref<UpdateProgress | null>(null);
-
-// Update state for the Settings page: the status the backend knows (it also checks in
-// the background and pushes the result), a manual "check now" and "install".
-export function useUpdates() {
+// One store for every page. Three useUpdates() calls used to each own a
+// mutation and each subscribe to the same IPC events.
+const useUpdateStore = defineStore("updates", () => {
   const queryClient = useQueryClient();
+  const progress = ref<UpdateProgress | null>(null);
+  const installError = ref(false);
 
   const status = useQuery({
     queryKey: KEY,
@@ -26,37 +26,45 @@ export function useUpdates() {
     mutationFn: async () => {
       await window.tiny.api.call("installUpdate");
     },
+    onError: () => {
+      progress.value = null;
+      installError.value = true;
+    },
   });
 
-  let offStatus: (() => void) | undefined;
-  let offProgress: (() => void) | undefined;
-  onMounted(() => {
-    offStatus = window.tiny?.api.on("update-status", (next: UpdateStatus) =>
+  let listening = false;
+  function listen(): void {
+    if (listening || !window.tiny) return;
+    listening = true;
+    window.tiny.api.on("update-status", (next: UpdateStatus) =>
       queryClient.setQueryData(KEY, next),
     );
-    offProgress = window.tiny?.api.on("update-progress", (next: UpdateProgress) => {
+    window.tiny.api.on("update-progress", (next: UpdateProgress) => {
       progress.value = next;
     });
-  });
-  onUnmounted(() => {
-    offStatus?.();
-    offProgress?.();
-  });
+  }
 
   return {
     status,
+    progress,
+    installError,
     check: () => check.mutate(),
     install: () => {
+      if (install.isPending.value) return;
+      installError.value = false;
       progress.value = { received: 0, total: null };
-      install.mutate(undefined, {
-        onError: () => {
-          progress.value = null;
-        },
-      });
+      install.mutate();
     },
-    progress,
     isChecking: check.isPending,
     isInstalling: install.isPending,
     available: computed(() => status.data.value?.state === "available"),
+    listen,
   };
+});
+
+/** shared update state; listeners are registered once */
+export function useUpdates() {
+  const store = useUpdateStore();
+  onMounted(() => store.listen());
+  return store;
 }
