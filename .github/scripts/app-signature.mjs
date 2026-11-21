@@ -52,7 +52,7 @@ export function assertApp(app, config, arch) {
   );
   if (problems.length) throw new Error(problems.join("\n"));
   for (const name of [config.name, "tjs"])
-    run("/usr/bin/lipo", ["-verify_arch", arch, join(macos, name)]);
+    run("/usr/bin/lipo", [join(macos, name), "-verify_arch", arch]);
   const plist = join(app, "Contents", "Info.plist");
   for (const [key, expected] of [
     ["CFBundleIdentifier", config.id],
