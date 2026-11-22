@@ -1,7 +1,7 @@
 // Per-app network usage, grouped by bundle or CLI service.
 // One `nettop` stream gives a cumulative per-process reading every second; deltas
-// between readings are attributed to the app owning the pid. Icons come from
-// NSWorkspace via JXA, rendered to a local cache and sent as data URLs.
+// between readings are attributed to the app owning the pid (see attribution.ts).
+// Icons come from NSWorkspace via JXA, rendered to a local cache and sent as data URLs.
 
 import type {
   AppEntry,
@@ -12,7 +12,19 @@ import type {
   TopApp,
   UsageRow,
 } from "../shared/types";
+import { isBundlePath } from "../shared/settings";
+import {
+  OTHER,
+  createResolver,
+  historicalApp,
+  lookupError,
+  readProcessTable,
+  readSessionHosts,
+  resolveAliases,
+  type AppRef,
+} from "./attribution";
 import { createNettopParser, type ProcSample } from "./nettop";
+import { run } from "./run";
 
 // nettop block-buffers when stdout is a pipe, so it runs under a pty (`script`): each
 // reading arrives as soon as it is printed (CRLF line ends, handled in onLine).
@@ -25,26 +37,7 @@ import { createNettopParser, type ProcSample } from "./nettop";
 // and only the VPN daemon's did show. Loopback and AWDL stay out.
 // Socket mode (no -P): each process row is followed by its sockets with their
 // interface, which is what tells a VPN's carrier socket apart (see endSample).
-const PS = "/bin/ps";
 const OSASCRIPT = "/usr/bin/osascript";
-const TMUX_CANDIDATES = ["/opt/homebrew/bin/tmux", "/usr/local/bin/tmux", "/usr/bin/tmux"];
-// Finder and Login Items give the app a PATH without Homebrew, so a bare
-// `tmux` never resolves in a packaged build. Probe the real locations.
-let tmuxBin: string | null | undefined;
-async function tmuxPath(): Promise<string | null> {
-  if (tmuxBin !== undefined) return tmuxBin;
-  tmuxBin = null;
-  for (const path of TMUX_CANDIDATES) {
-    try {
-      await tjs.stat(path);
-      tmuxBin = path;
-      break;
-    } catch {
-      // not installed there
-    }
-  }
-  return tmuxBin;
-}
 // -P drops the per-socket lines. Socket mode is only worth it while a utun
 // interface is moving bytes (VPN carrier subtraction); otherwise it is
 // thousands of lines a second for the interpreter to split.
@@ -64,7 +57,10 @@ function streamArgs(sockets: boolean): string[] {
 const TUNNEL_PORTS = new Set([51820, 1194, 1195, 1197, 1198, 500, 4500, 1701]);
 const CARRIER_MIN_BYTES = 4096;
 const CARRIER_MATCH = { low: 0.4, high: 1.6 };
-const NAMES_REFRESH_MS = 10_000; // unknown pids refresh immediately; this only catches renames
+const NAMES_REFRESH_MS = 10_000; // unknown pids refresh sooner; this only catches renames
+// a burst of new processes (a build, a script) rescans at most this often: each scan
+// lists every process and looks up all their paths
+const UNKNOWN_REFRESH_MS = 2_000;
 // nettop reports a process for a few more readings after it exits (its last bytes among
 // them), so a pid that left `ps` keeps its app this long
 const GONE_KEEP_MS = 15_000;
@@ -88,231 +84,9 @@ function run(argv) {
 }
 `;
 
-// macOS "responsible process": the app a process works on behalf of, e.g. the
-// terminal behind a shell, `claude` or `curl`, or Safari behind its WebKit helpers.
-// Private libSystem call, so fall back to the executable path. It does not reach
-// into a detached session: its server is launched by launchd and is responsible for
-// itself and for everything inside (see SESSION_HOSTS).
-// libSystem is opened by its full path: the runtime tinyjs bundled up to txiki.js
-// 26.6 could not resolve the bare name "c", so the lookup was silently missing and
-// every terminal's traffic (curl, git, brew: no ".app" in their path) was dropped.
-const LIBSYSTEM = "/usr/lib/libSystem.B.dylib";
-let responsiblePid: ((pid: number) => number) | null = null;
-// Kernel vnode path, not the process-controlled ps `comm` label.
-let procPath: ((pid: number) => string) | null = null;
-let lookupError: string | null = null; // why responsiblePid is missing, reported by createAppTracker
-try {
-  const { dlopen } = await import("tjs:ffi");
-  const { symbols } = dlopen(LIBSYSTEM, {
-    responsibility_get_pid_responsible_for_pid: { args: ["i32"], returns: "i32" },
-  });
-  responsiblePid = (pid) => symbols.responsibility_get_pid_responsible_for_pid(pid);
-} catch (err) {
-  lookupError = err instanceof Error ? err.message : String(err);
-  console.error("tor apps: responsible-pid lookup unavailable:", err);
-}
-try {
-  const { dlopen } = await import("tjs:ffi");
-  const { symbols } = dlopen(LIBSYSTEM, {
-    proc_pidpath: { args: ["i32", "buffer", "u32"], returns: "i32" },
-  });
-  const pathBuf = new Uint8Array(4096);
-  const decoder = new TextDecoder();
-  procPath = (pid) => {
-    const n = symbols.proc_pidpath(pid, pathBuf, pathBuf.length);
-    if (n <= 0) return "";
-    return decoder.decode(pathBuf.subarray(0, n));
-  };
-} catch (err) {
-  console.error("tor apps: process paths unavailable:", err);
-}
-
-async function run(args: string[]): Promise<string> {
-  const proc = tjs.spawn(args, { stdout: "pipe", stderr: "ignore" });
-  const text = await proc.stdout!.text();
-  const status = await proc.wait();
-  if (status.exit_status !== 0) throw new Error(`${args[0]} exited with ${status.exit_status}`);
-  return text;
-}
-
-// "" when the command is missing or fails (no tmux, or no server running)
-async function tryRun(args: string[]): Promise<string> {
-  try {
-    return await run(args);
-  } catch {
-    return "";
-  }
-}
-
-// Detached session hosts: a server that outlives the terminal and is reparented to
-// launchd (tmux, screen, zellij, dtach, abduco, ...), so the responsible-process
-// lookup stops at it and everything inside is unattributed. The terminal is only
-// reachable through the client: an ordinary child of the terminal's shell running the
-// same program, whose responsible process is the terminal app. The server's subtree
-// is attributed to its newest client, matched by a shared argument (a socket path or
-// session name) when the server has several; tmux knows its sessions, so its panes
-// are mapped to the client attached to their own session. Adding a host: its
-// executable name below, and a precise mapping if the generic one is too coarse.
-const SESSION_HOSTS = new Set(["tmux", "screen", "zellij", "dtach", "abduco"]);
-
-interface SessionHosts {
-  tmux: {
-    panes: Map<string, string>; // pane_pid → session id
-    clients: Map<string, { pid: string; activity: number }>; // session id → newest client
-  };
-  args: Map<string, string[]>; // pid → argv (without argv[0]) of the host processes
-}
-
-function hostName(path: string): string | null {
-  const name = path.slice(path.lastIndexOf("/") + 1).toLowerCase();
-  return SESSION_HOSTS.has(name) ? name : null;
-}
-
-async function readSessionHosts(paths: Map<string, string>): Promise<SessionHosts> {
-  const hosts: SessionHosts = { tmux: { panes: new Map(), clients: new Map() }, args: new Map() };
-  const hostPids = [...paths].filter(([, path]) => hostName(path)).map(([pid]) => pid);
-  if (!hostPids.length) return hosts;
-  const tmux = hostPids.some((pid) => hostName(paths.get(pid) ?? "") === "tmux")
-    ? await tmuxPath()
-    : null;
-  const [argsOut, paneOut, clientOut] = await Promise.all([
-    tryRun([PS, "-o", "pid=,args=", "-p", hostPids.join(",")]),
-    tmux
-      ? tryRun([tmux, "list-panes", "-a", "-F", "#{pane_pid} #{session_id}"])
-      : Promise.resolve(""),
-    tmux
-      ? tryRun([tmux, "list-clients", "-F", "#{client_pid} #{session_id} #{client_activity}"])
-      : Promise.resolve(""),
-  ]);
-  for (const line of argsOut.split("\n")) {
-    const m = line.match(/^\s*(\d+)\s+(.*)$/);
-    if (m) hosts.args.set(m[1], m[2].split(/\s+/).slice(1).filter(Boolean));
-  }
-  for (const line of paneOut.split("\n")) {
-    const [pid, session] = line.trim().split(" ");
-    if (pid && session) hosts.tmux.panes.set(pid, session);
-  }
-  for (const line of clientOut.split("\n")) {
-    const [pid, session, activity] = line.trim().split(" ");
-    if (!pid || !session) continue;
-    const at = Number(activity) || 0;
-    const cur = hosts.tmux.clients.get(session);
-    if (!cur || at >= cur.activity) hosts.tmux.clients.set(session, { pid, activity: at });
-  }
-  return hosts;
-}
-
-// Outermost .app of an executable path — null for daemons, CLIs and system internals
-interface AppRef {
-  name: string;
-  bundle: string;
-}
-
-// Processes that move bytes for an app without living in its bundle: system daemons
-// that download for the App Store, and Steam, whose /Applications/Steam.app is only a
-// bootstrapper for a client installed under Application Support (no ".app/" in its
-// path, and its helpers sit in a nested "Steam Helper.app").
-// Terminals with a server (Rex, Herdr) are the other kind: the window is one app, the
-// shells run under a server bundle launched by launchd ("Rex Server.app", "Herdr
-// Core.app", or a bare herdr-core binary), which is their responsible process, so
-// all the traffic of what runs inside would be filed under the server, or dropped
-// when its path has no .app in it. Those servers are looked up by the bundle id of
-// the window app they belong to (see resolveAliases), so moving the app is fine.
-const HOME = tjs.homeDir;
-const APP_STORE: AppRef = { name: "App Store", bundle: "/System/Applications/App Store.app" };
-const STEAM: AppRef = { name: "Steam", bundle: "/Applications/Steam.app" };
-const APP_ALIASES: { prefix: string; app: AppRef }[] = [
-  { prefix: "/System/Library/PrivateFrameworks/AppStoreDaemon.framework/", app: APP_STORE },
-  { prefix: "/System/Library/PrivateFrameworks/CommerceKit.framework/", app: APP_STORE },
-  { prefix: "/System/Applications/App Store.app/", app: APP_STORE },
-  { prefix: `${HOME}/Library/Application Support/Steam/`, app: STEAM },
-];
-// server paths → the bundle id of the terminal app that shows them
-const SERVER_ALIASES: { prefixes: string[]; bundleId: string }[] = [
-  {
-    prefixes: [`${HOME}/Library/Application Support/com.superlogical.rex/`],
-    bundleId: "com.superlogical.rex", // Rex (Beta): "Rex Server.app" under Application Support
-  },
-  {
-    prefixes: [`${HOME}/.local/share/herdr-core/`, `${HOME}/.local/bin/herdr-core`],
-    bundleId: "dev.herdr.app", // Herdr: "Herdr Core.app" (or a bare herdr-core) under ~/.local
-  },
-];
-
-// Coding agents that make their model calls from one background service shared by every
-// terminal: opencode starts "opencode serve --service" under launchd the first time and
-// every later session, from any terminal, only talks to it over loopback. Its responsible
-// process is whichever app started it first (Herdr, say), so all sessions' traffic would
-// be filed under that app, and no terminal could be told apart anyway. The service, and
-// what it runs for the agent, get a row of their own instead. Only processes with no
-// .app of their own are claimed: a GUI app an agent opens keeps its row. Adding an
-// agent: the name of its executable below.
-const AGENT_SERVICES: { exe: string; bundleId: string; app: AppRef }[] = [
-  { exe: "opencode", bundleId: "ai.opencode.desktop", app: { name: "OpenCode", bundle: "" } },
-];
-// Everything that is not a real app and not an Apple system binary. Hidden
-// launchd agents and CLIs used to vanish from the totals.
-const OTHER: AppRef = { name: "System & CLI", bundle: "" };
-const SYSTEM_PREFIXES = ["/System/Library/", "/usr/libexec/", "/usr/sbin/", "/usr/lib/"];
-
-// JXA: where NSWorkspace finds the app with each bundle id (one path per line, "" if none)
-const APP_PATHS_SCRIPT = `ObjC.import("AppKit");
-function run(argv) {
-  return argv.map((id) => {
-    const url = $.NSWorkspace.sharedWorkspace.URLForApplicationWithBundleIdentifier(id);
-    return url.isNil() ? "" : url.path.js;
-  }).join("\\n");
-}
-`;
-
-// Add an alias per installed terminal app for the server paths that run on its behalf.
-// Apps not installed are skipped: their servers cannot be running either. An agent's row
-// (AGENT_SERVICES) gets the bundle of its desktop app when that is installed.
-async function resolveAliases(dir: string): Promise<void> {
-  const script = `${dir}/apppaths.jxa.js`;
-  await tjs.writeFile(script, APP_PATHS_SCRIPT);
-  const ids = [...SERVER_ALIASES, ...AGENT_SERVICES].map((a) => a.bundleId);
-  const out = await tryRun([OSASCRIPT, "-l", "JavaScript", script, ...ids]);
-  const lines = out.replace(/\n$/, "").split("\n");
-  SERVER_ALIASES.forEach(({ prefixes }, i) => {
-    const bundle = lines[i];
-    const name = bundle?.match(/([^/]+)\.app$/)?.[1];
-    if (!bundle || !name) return;
-    for (const prefix of prefixes) APP_ALIASES.push({ prefix, app: { name, bundle } });
-  });
-  AGENT_SERVICES.forEach(({ app }, i) => {
-    const bundle = lines[SERVER_ALIASES.length + i];
-    if (bundle?.startsWith("/") && bundle.endsWith(`/${app.name}.app`)) app.bundle = bundle;
-  });
-}
-
-function isExtension(path: string): boolean {
-  // Network Extensions carry other apps' traffic: counting them counts it twice
-  return path.startsWith("/Library/SystemExtensions/") || /\.(appex|systemextension)\//.test(path);
-}
-
-function isSystem(path: string): boolean {
-  return SYSTEM_PREFIXES.some((prefix) => path.startsWith(prefix));
-}
-
-function aliasOf(path: string): AppRef | null {
-  for (const { prefix, app } of APP_ALIASES) {
-    if (prefix.endsWith("/") ? path.startsWith(prefix) : path === prefix) return app;
-  }
-  return null;
-}
-
-function appOf(path: string): AppRef | null {
-  if (isExtension(path)) return null;
-  const alias = aliasOf(path);
-  if (alias) return alias;
-  // A real bundle has Contents/. A path that merely contains ".app" does not.
-  const m = path.match(/^(.*?\/([^/]+)\.app)\/Contents\//);
-  return m ? { name: m[2], bundle: m[1] } : null;
-}
-
 const PERIOD_DAYS: Record<Period, number> = { today: 1, "7d": 7, "30d": 30 };
 const KEEP_DAYS = 90;
+const ACTIVE_WINDOW_MS = 2_500; // smooth out the one-second nettop sampling interval
 
 // local calendar day, e.g. "2026-11-04"
 function dayKey(date: Date): string {
@@ -325,6 +99,8 @@ function daysAgo(days: number): string {
   date.setDate(date.getDate() - days);
   return dayKey(date);
 }
+
+type Counts = { in: number; out: number };
 
 export interface AppTracker {
   /** `period` may also be a count of days */
@@ -391,17 +167,13 @@ export async function createAppTracker(
   await tjs.writeFile(iconScript, ICON_SCRIPT);
   await tjs.makeDir(iconDir, { recursive: true });
   await resolveAliases(scriptDir);
-  // History recorded under a server's own name before its alias existed ("Herdr Core",
-  // "Rex Server"), or under a row's earlier name ("opencode"), is folded into the app it
-  // stands for, so the list shows one entry
+  // History recorded under a helper's own bundle before its alias existed ("Herdr Core",
+  // "Rex Server", Setapp's agent), under a row's earlier name ("opencode"), or under a
+  // translocated copy, is folded into the app it stands for, so the list shows one entry
   for (const [day, apps] of Object.entries(daily)) {
     for (const [key, v] of Object.entries(apps)) {
       const previous = v.name || key;
-      const agent =
-        !v.bundle &&
-        AGENT_SERVICES.find(({ exe, app }) => previous === exe || previous === app.name);
-      const app =
-        (agent ? agent.app : null) ?? (v.bundle ? aliasOf(`${v.bundle}/Contents/`) : null);
+      const app = historicalApp(previous, v.bundle);
       const id = app ? app.bundle || app.name : key;
       const display = app?.name ?? previous;
       v.name = display;
@@ -415,7 +187,7 @@ export async function createAppTracker(
       const into = (apps[id] ??= { down: 0, up: 0, bundle: v.bundle, name: display });
       into.down += v.down;
       into.up += v.up;
-      into.bundle = app?.bundle || v.bundle;
+      into.bundle = app ? app.bundle : v.bundle;
       into.name = display;
       delete apps[key];
       touched.add(`${day}\0${id}`);
@@ -425,12 +197,16 @@ export async function createAppTracker(
   const pids = new Map<string, AppRef | null>(); // pid → app | null (drop: extension or Apple system)
   const pidPath = new Map<string, string>(); // pid → vnode path last refresh, to spot reuse
   const gone = new Map<string, number>(); // pid → when it was last missing from ps
-  const sessionApp = new Map<string, { app: AppRef; seen: number }>();
-  const last = new Map<string, { in: number; out: number }>(); // pid → cumulative at the previous reading
-  const lastSock = new Map<string, { in: number; out: number }>(); // "pid|socket" → cumulative at the previous reading
-  const responsibleOf = new Map<string, { path: string; pid: number }>();
+  const resolverState = {
+    responsibleOf: new Map<string, { path: string; pid: number }>(),
+    sessionApp: new Map<string, { app: AppRef; seen: number }>(),
+  };
+  const last = new Map<string, Counts>(); // pid → cumulative at the previous reading
+  const lastSock = new Map<string, Map<string, Counts>>(); // pid → socket → cumulative at the previous reading
   const sampleSeen = new Map<string, number>();
-  const pending = new Map<string, { down: number; up: number; since: number }>();
+  // bytes of pids not in the last process scan; `at` is when they last moved
+  const pending = new Map<string, { down: number; up: number; since: number; at: number }>();
+  const lastActivity = new Map<string, number>(); // app identity → when it last moved bytes
   const icons = new Map<string, { url: string; path: string; revision: number }>();
   let iconRevision = 0;
   const iconChecked = new Map<string, number>(); // identity → when its bundle was last looked at
@@ -439,13 +215,15 @@ export async function createAppTracker(
   let streamSeq = 0; // which stream() is current: an older one ending must not restart
   let refreshing: Promise<void> | null = null;
   let again = false; // a pid showed up while a refresh was awaiting ps
+  let lastScanAt = -Infinity;
+  let scanTimer: ReturnType<typeof setTimeout> | undefined;
   let stopped = false;
   let socketMode = false;
 
   function forgetPid(pid: string): void {
     forgetSample(pid);
-    for (const key of lastSock.keys()) if (key.startsWith(`${pid}|`)) lastSock.delete(key);
-    responsibleOf.delete(pid);
+    lastSock.delete(pid);
+    resolverState.responsibleOf.delete(pid);
     pidPath.delete(pid);
   }
 
@@ -458,13 +236,14 @@ export async function createAppTracker(
     for (const [pid, bytes] of pending) {
       if (now - bytes.since < GONE_KEEP_MS) continue;
       // The process was too short-lived for ps; the bytes still belong in totals.
-      add(OTHER, bytes.down, bytes.up);
+      add(OTHER, bytes.down, bytes.up, bytes.at);
       pending.delete(pid);
     }
     for (const [pid, at] of sampleSeen)
       if (!pids.has(pid) && now - at >= GONE_KEEP_MS) forgetSample(pid);
-    for (const [key, entry] of sessionApp)
-      if (now - entry.seen >= 10 * 60_000) sessionApp.delete(key);
+    for (const [key, entry] of resolverState.sessionApp)
+      if (now - entry.seen >= 10 * 60_000) resolverState.sessionApp.delete(key);
+    for (const [id, at] of lastActivity) if (now - at >= ACTIVE_WINDOW_MS) lastActivity.delete(id);
   }
 
   function refreshPids(): Promise<void> {
@@ -472,106 +251,37 @@ export async function createAppTracker(
     refreshing ??= (async () => {
       while (again && !stopped) {
         again = false;
-        const paths = new Map<string, string>();
-        const parent = new Map<string, string>();
-        for (const line of (await run([PS, "-axo", "pid=,ppid="])).split("\n")) {
-          const m = line.match(/^\s*(\d+)\s+(\d+)\s*$/);
-          if (!m) continue;
-          paths.set(m[1], procPath?.(Number(m[1])) ?? "");
-          parent.set(m[1], m[2]);
-        }
-        const hosts = await readSessionHosts(paths);
+        lastScanAt = Date.now();
+        const table = await readProcessTable();
+        const hosts = await readSessionHosts(table.paths);
         if (stopped) return;
-        const direct = (pid: string): AppRef | null => {
-          const path = paths.get(pid);
-          if (!path || isExtension(path)) return null;
-          const cached = responsibleOf.get(pid);
-          const owner =
-            cached && cached.path === path ? cached.pid : (responsiblePid?.(Number(pid)) ?? 0);
-          responsibleOf.set(pid, { path, pid: owner });
-          const ownerPath = owner > 0 ? paths.get(String(owner)) : undefined;
-          return (ownerPath && appOf(ownerPath)) || appOf(path);
-        };
-        // an agent's service, or something it runs: its own row, ahead of the responsible app
-        const agentOf = (pid: string): AppRef | null => {
-          if (appOf(paths.get(pid) ?? "")) return null; // an app of its own keeps its row
-          for (let p: string | undefined = pid, hops = 0; p && p !== "1" && hops < 64; hops++) {
-            const path = paths.get(p) ?? "";
-            const exe = path.slice(path.lastIndexOf("/") + 1);
-            const agent = AGENT_SERVICES.find((a) => a.exe === exe);
-            if (agent) return agent.app;
-            p = parent.get(p);
-          }
-          return null;
-        };
-        // the terminal behind a session: its client's app now, else the one last seen,
-        // so a detached session keeps counting where it was shown
-        const remember = (key: string, app: AppRef | null): AppRef | null => {
-          const entry = app ?? sessionApp.get(key)?.app;
-          if (entry) sessionApp.set(key, { app: entry, seen: Date.now() });
-          return entry ?? null;
-        };
-        const tmuxSession = (session: string): AppRef | null => {
-          const client = hosts.tmux.clients.get(session);
-          return remember(`tmux:${session}`, client ? direct(client.pid) : null);
-        };
-        // a host server's client: same program under a terminal, sharing an argument
-        // (socket path, session name) with the server when any client does
-        const hostClient = (server: string, name: string): AppRef | null => {
-          const serverArgs = new Set(hosts.args.get(server) ?? []);
-          let best: { pid: number; shared: boolean; app: AppRef } | null = null;
-          for (const [pid, path] of paths) {
-            if (pid === server || hostName(path) !== name) continue;
-            const app = direct(pid);
-            if (!app) continue;
-            const shared = (hosts.args.get(pid) ?? []).some((arg) => serverArgs.has(arg));
-            const n = Number(pid);
-            if (!best || (shared && !best.shared) || (shared === best.shared && n > best.pid)) {
-              best = { pid: n, shared, app };
-            }
-          }
-          return remember(`${name}:${server}`, best?.app ?? null);
-        };
-        // a process inside a session: walk up to the pane (tmux) or to the host server
-        const sessionHostApp = (pid: string): AppRef | null => {
-          for (let p: string | undefined = pid, hops = 0; p && p !== "1" && hops < 64; hops++) {
-            const session = hosts.tmux.panes.get(p);
-            if (session) return tmuxSession(session);
-            const name = hostName(paths.get(p) ?? "");
-            if (name && parent.get(p) === "1") return hostClient(p, name);
-            p = parent.get(p);
-          }
-          return null;
-        };
+        const resolve = createResolver(table, hosts, resolverState);
         const next = new Map<string, AppRef | null>();
-        for (const pid of paths.keys()) {
-          const path = paths.get(pid) ?? "";
+        for (const [pid, path] of table.paths) {
           const known = pidPath.get(pid);
           if (gone.has(pid) || (known && path && known !== path)) forgetPid(pid);
           pidPath.set(pid, path);
-          let app = isExtension(path) ? null : (agentOf(pid) ?? direct(pid) ?? sessionHostApp(pid));
-          // not an app and not an Apple binary: keep it visible instead of dropping it
-          if (!app && !isSystem(path) && !isExtension(path)) app = OTHER;
-          next.set(pid, app);
+          next.set(pid, resolve(pid));
         }
         // just exited: keep the app for the readings nettop still prints for it
         const now = Date.now();
         for (const [pid, app] of pids) {
-          if (paths.has(pid)) continue;
+          if (table.paths.has(pid)) continue;
           const since = gone.get(pid) ?? now;
           if (now - since < GONE_KEEP_MS) {
             gone.set(pid, since);
             next.set(pid, app);
           } else forgetPid(pid); // recycled pids must not inherit this baseline
         }
-        for (const pid of gone.keys()) if (!next.has(pid) || paths.has(pid)) gone.delete(pid);
-        for (const pid of responsibleOf.keys()) if (!next.has(pid)) responsibleOf.delete(pid);
+        for (const pid of gone.keys()) if (!next.has(pid) || table.paths.has(pid)) gone.delete(pid);
+        for (const pid of resolverState.responsibleOf.keys())
+          if (!next.has(pid)) resolverState.responsibleOf.delete(pid);
         pids.clear();
         for (const [pid, app] of next) pids.set(pid, app);
         for (const [pid, bytes] of pending) {
           if (!pids.has(pid)) continue; // showed up after ps: the next pass keeps it
           const app = pids.get(pid);
-          if (app) add(app, bytes.down, bytes.up);
+          if (app) add(app, bytes.down, bytes.up, bytes.at);
           pending.delete(pid);
         }
       } // again: a pid arrived while this pass was awaiting ps
@@ -583,15 +293,40 @@ export async function createAppTracker(
     return refreshing;
   }
 
+  // a pid nettop reported that the last scan did not know: scan again, at once when
+  // the last scan is old enough, else once UNKNOWN_REFRESH_MS has passed
+  function refreshSoon(): void {
+    if (scanTimer !== undefined || stopped) return;
+    const wait = Math.max(0, lastScanAt + UNKNOWN_REFRESH_MS - Date.now());
+    scanTimer = setTimeout(() => {
+      scanTimer = undefined;
+      void refreshPids();
+    }, wait);
+  }
+
   function identity(app: AppRef): string {
     return app.bundle || app.name;
+  }
+
+  // Each bundle keeps one cached PNG, named after its path and modification time.
+  // Earlier ones (the app was updated since) are deleted once the current one loads.
+  async function pruneIcons(prefix: string, keep: string): Promise<void> {
+    const dir = await tjs.readDir(iconDir);
+    try {
+      for await (const entry of dir) {
+        const path = `${iconDir}/${entry.name}`;
+        if (entry.name.startsWith(prefix) && path !== keep) await tjs.remove(path).catch(() => {});
+      }
+    } finally {
+      await dir.close();
+    }
   }
 
   // Rendered once per app and kept across launches. The page gets a data URL,
   // so it does not need readAccess to the icon directory. A missing bundle is
   // remembered for ICON_RECHECK_MS instead of being statted on every poll.
   function loadIcon(app: AppRef): void {
-    if (!app.bundle) return;
+    if (!isBundlePath(app.bundle)) return;
     const id = identity(app);
     const now = Date.now();
     const checked = iconChecked.get(id);
@@ -618,7 +353,7 @@ export async function createAppTracker(
         url: `data:image/png;base64,${btoa(binary)}`,
         revision: ++iconRevision,
       });
-      if (known) void tjs.remove(known.path).catch(() => {});
+      await pruneIcons(`${fingerprint}-`, out);
     })().catch(() => {
       // Keep the old icon and retry only after ICON_RECHECK_MS.
     });
@@ -641,10 +376,12 @@ export async function createAppTracker(
     return value;
   }
 
-  function add(app: AppRef, down: number, up: number): void {
+  /** `at`: when the bytes moved, for the activity dot (late-attributed bytes are old) */
+  function add(app: AppRef, down: number, up: number, at = Date.now()): void {
+    const id = identity(app);
+    if ((down > 0 || up > 0) && at > (lastActivity.get(id) ?? -Infinity)) lastActivity.set(id, at);
     const day = dayKey(new Date());
     const today = (daily[day] ??= Object.create(null) as Record<string, AppEntry>);
-    const id = identity(app);
     const entry = (today[id] ??= { down: 0, up: 0, bundle: app.bundle, name: app.name });
     entry.down += down;
     entry.up += up;
@@ -691,39 +428,38 @@ export async function createAppTracker(
   function endSample(procs: ProcSample[], establish: boolean, sockets: boolean): void {
     const now = Date.now();
     expireTraffic(now);
-    const delta = (
-      map: Map<string, { in: number; out: number }>,
-      key: string,
-      cur: { in: number; out: number },
-    ): { down: number; up: number } => {
-      const prev = map.get(key);
-      map.set(key, cur);
-      // first seen after priming: a new process/socket, all its bytes are new
+    // first seen after priming: a new process/socket, all its bytes are new
+    const delta = (prev: Counts | undefined, cur: Counts): { down: number; up: number } => {
       const base = prev ?? (establish ? cur : { in: 0, out: 0 });
       return { down: Math.max(0, cur.in - base.in), up: Math.max(0, cur.out - base.out) };
     };
     // pass 1: socket deltas; what the tunnels moved, and the UDP sockets that might carry it
-    const seen = new Set<string>();
+    const seenPids = new Set<string>();
     let tunnel = 0;
     const udp: { proc: ProcSample; down: number; up: number; port: number }[] = [];
     const perProc = new Map<ProcSample, { down: number; up: number }>();
     for (const proc of procs) {
       sampleSeen.set(proc.pid, now);
-      perProc.set(proc, delta(last, proc.pid, proc));
+      perProc.set(proc, delta(last.get(proc.pid), proc));
+      last.set(proc.pid, proc);
+      // a process-only sample has no sockets; wiping baselines here would
+      // double-count them the next time socket mode starts
+      if (!sockets) continue;
+      seenPids.add(proc.pid);
+      const before = lastSock.get(proc.pid);
+      const after = new Map<string, Counts>();
       for (const sock of proc.sockets) {
-        const key = `${proc.pid}|${sock.key}`;
-        seen.add(key);
-        const d = delta(lastSock, key, sock);
+        const d = delta(before?.get(sock.key), sock);
+        after.set(sock.key, sock);
         if (!d.down && !d.up) continue;
         if (sock.iface.startsWith("utun")) tunnel += d.down + d.up;
         else if (sock.udp && sock.iface && !sock.iface.startsWith("lo")) {
           udp.push({ proc, ...d, port: sock.remotePort });
         }
       }
+      lastSock.set(proc.pid, after);
     }
-    // a process-only sample has no sockets; wiping baselines here would
-    // double-count them the next time socket mode starts
-    if (sockets) for (const key of lastSock.keys()) if (!seen.has(key)) lastSock.delete(key);
+    if (sockets) for (const pid of lastSock.keys()) if (!seenPids.has(pid)) lastSock.delete(pid);
     // pass 2: a known tunnel port counts as the carrier only when it also
     // moves about as much as the tunnel. A quiet utun must not zero every
     // flow to those ports, and a QUIC flow must not match on size alone.
@@ -741,15 +477,16 @@ export async function createAppTracker(
     for (const [proc, d] of perProc) {
       if (!d.down && !d.up) continue;
       if (!pids.has(proc.pid)) {
-        const p = pending.get(proc.pid) ?? { down: 0, up: 0, since: now };
+        const p = pending.get(proc.pid) ?? { down: 0, up: 0, since: now, at: now };
         p.down += d.down;
         p.up += d.up;
+        p.at = now;
         pending.set(proc.pid, p);
-        void refreshPids();
+        refreshSoon();
         continue;
       }
       const app = pids.get(proc.pid);
-      if (app) add(app, d.down, d.up);
+      if (app) add(app, d.down, d.up, now);
     }
   }
 
@@ -805,14 +542,17 @@ export async function createAppTracker(
 
   function top(n: number, period: Period | number = "today"): TopApp[] {
     const source = history(typeof period === "number" ? period : (PERIOD_DAYS[period] ?? 1));
+    const now = Date.now();
     return [...source.entries()]
       .map(([id, v]) => {
         const icon = icons.get(v.bundle || id);
+        const lastActive = lastActivity.get(v.bundle || id);
         return {
           name: v.name || id,
           bundle: v.bundle,
           down: v.down,
           up: v.up,
+          active: lastActive !== undefined && now - lastActive < ACTIVE_WINDOW_MS,
           icon: icon?.url ?? null,
           iconRevision: icon?.revision,
         };
@@ -918,6 +658,7 @@ export async function createAppTracker(
     async stop() {
       stopped = true;
       clearInterval(pidTimer);
+      clearTimeout(scanTimer);
       killStream();
       await tjs.remove(scriptDir).catch(() => {});
     },

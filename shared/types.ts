@@ -27,6 +27,8 @@ export interface TopApp extends Traffic {
   name: string;
   /** .app bundle path when this row is a real app; empty for System & CLI and agents */
   bundle?: string;
+  /** whether this app transferred data recently */
+  active?: boolean;
   /** data URL, sent once, then left out */
   icon?: string | null;
   /** identifies the icon contents so the page can acknowledge receiving them */

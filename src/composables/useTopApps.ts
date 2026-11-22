@@ -6,7 +6,7 @@ import { useTrafficStore } from "@/stores/traffic";
 const key = (period: Period) => ["top-apps", period] as const;
 const withoutIcon = ({ icon: _icon, ...app }: TopApp): TopApp => app; // icons are cached separately
 
-// Top apps for the selected period. Each period is cached by TanStack Query, so
+// Connections for the selected period. Each period is cached by TanStack Query, so
 // switching tabs shows the last result at once (and refetches when it is stale);
 // the backend also pushes live updates for the visible tab straight into the cache.
 export function useTopApps() {

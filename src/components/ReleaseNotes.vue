@@ -219,9 +219,4 @@ function openLinkInBrowser(event: MouseEvent): void {
   border: 0;
   border-top: 1px solid var(--notes-rule);
 }
-
-.release-notes :deep(img) {
-  max-width: 100%;
-  border-radius: 8px;
-}
 </style>

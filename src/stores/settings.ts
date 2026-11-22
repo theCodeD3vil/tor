@@ -26,7 +26,7 @@ export const useSettingsStore = defineStore("settings", () => {
     }
   }
 
-  // hide an app from Top apps and the totals (it keeps being recorded), or show it again
+  // hide an app from Connections and the totals (it keeps being recorded), or show it again
   function ignoreApp(name: string, bundle = ""): Promise<unknown> {
     const app = { name, bundle };
     const ignoredApps = settings.value.ignoredApps;

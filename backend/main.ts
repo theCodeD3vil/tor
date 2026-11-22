@@ -139,7 +139,15 @@ function buckets(): Traffic[] {
 
 const PERIODS: Period[] = ["today", "7d", "30d"];
 const STATS_RANGES: StatsRange[] = [7, 30, 90];
-let appsPeriod: Period = "today"; // which top-apps tab the popover shows
+let appsPeriod: Period = "today"; // which Connections tab the popover shows
+
+// page parameters are untrusted and may be missing altogether
+const param = (params: unknown, key: string): unknown =>
+  params && typeof params === "object" ? (params as Record<string, unknown>)[key] : undefined;
+const periodParam = (params: unknown): Period => {
+  const period = param(params, "period");
+  return PERIODS.includes(period as Period) ? (period as Period) : "today";
+};
 
 export const api: Record<string, TinyApiHandler> = {
   openExternalLink: (params: unknown, app) => {
@@ -158,11 +166,11 @@ export const api: Record<string, TinyApiHandler> = {
   hidePopover: (_params, app) => {
     if (popoverOpen || opening) hidePopover(app);
   },
-  setPage: ({ page }: { page: string }) => {
-    popoverPage = page === "home" ? "home" : "other";
+  setPage: (params: unknown) => {
+    popoverPage = param(params, "page") === "home" ? "home" : "other";
   },
-  setAppsPeriod: ({ period }: { period: Period }) => {
-    appsPeriod = PERIODS.includes(period) ? period : "today";
+  setAppsPeriod: (params: unknown) => {
+    appsPeriod = periodParam(params);
   },
   // the popover's Quit button
   quit: (_params, app) => quitTor(app),
@@ -180,11 +188,13 @@ export const api: Record<string, TinyApiHandler> = {
   },
   getUpdateStatus: () => getUpdateStatus(),
   checkForUpdates: (_params, app) => checkForUpdates(app, true, pushUpdateStatus(app)),
-  installUpdate: (_params, app) => {
-    flushUsageOnQuit?.();
-    return installUpdate(app, (progress) =>
+  installUpdate: async (_params, app) => {
+    const installed = await installUpdate(app, (progress) =>
       app.window(POPOVER.id).push("update-progress", progress),
     );
+    // the new version is already starting and tinyjs quits this one in 250 ms:
+    // save what the download itself used and clean up, as Quit would
+    if (installed) await shutdown(app);
   },
   getVersion: async (_params, app) => (await app.info()).version,
   // the hidden apps with their icons, for the settings page
@@ -215,9 +225,11 @@ export const api: Record<string, TinyApiHandler> = {
   popoverReady: (params?: { generation?: number }) => {
     if (params?.generation === openGen) resolveReady?.();
   },
-  getApps: ({ period }: { period: Period }) => topApps(PERIODS.includes(period) ? period : "today"),
-  getStats: ({ days }: { days: StatsRange }) =>
-    statsPayload(STATS_RANGES.includes(days) ? days : 30),
+  getApps: (params: unknown) => topApps(periodParam(params)),
+  getStats: (params: unknown) => {
+    const days = param(params, "days");
+    return statsPayload(STATS_RANGES.includes(days as StatsRange) ? (days as StatsRange) : 30);
+  },
   // the page drew the menubar icon it was asked for (see setTray in init)
   setTrayIcon: (params?: { png?: unknown; token?: number }) => {
     if (typeof params?.token !== "number") return;
@@ -565,7 +577,7 @@ export async function init(app: TinyApp): Promise<void> {
     if (!quitting) flushUsage();
   }, 30_000);
   flushUsageOnQuit = flushUsage;
-  // top apps refresh every 500 ms while the home page is showing
+  // Connections refresh every 500 ms while the home page is showing
   let lastFrame = "";
   setInterval(() => {
     if (!popoverOpen || popoverPage !== "home") {
@@ -640,7 +652,8 @@ export function onSystem(kind: string): void {
   }
 }
 
-async function quitTor(app: TinyApp): Promise<void> {
+// stop everything and save the usage, before Quit or an update's relaunch
+async function shutdown(app: TinyApp): Promise<void> {
   if (quitting) return;
   quitting = true;
   clearTimeout(tickTimer);
@@ -651,6 +664,13 @@ async function quitTor(app: TinyApp): Promise<void> {
     usageDb?.close();
   } finally {
     await Promise.allSettled([appTracker?.stop(), iconTempDir && tjs.remove(iconTempDir)]);
+  }
+}
+
+async function quitTor(app: TinyApp): Promise<void> {
+  try {
+    await shutdown(app);
+  } finally {
     app.quit();
   }
 }

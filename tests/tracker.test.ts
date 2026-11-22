@@ -74,6 +74,37 @@ test("a stopped nettop stream cannot complete or clear a replacement frame", () 
   ]);
 });
 
+test("socket mode keeps tunnel and UDP sockets and drops other TCP flows", () => {
+  const samples: ProcSample[][] = [];
+  const parse = createNettopParser((rows) => samples.push(rows));
+  const header = ",interface,bytes_in,bytes_out,\r\n";
+  parse(
+    new TextEncoder().encode(
+      [
+        header,
+        "App.7,,500,600,\r\n",
+        "tcp4 10.0.0.2:5000<->1.1.1.1:443,en0,100,100,\r\n",
+        "tcp4 10.8.0.2:5001<->2.2.2.2:443,utun3,7,8,\r\n",
+        "udp4 10.0.0.2:6000<->3.3.3.3:51820,en0,9,10,\r\n",
+        header,
+      ].join(""),
+    ),
+  );
+  expect(samples).toEqual([
+    [
+      {
+        pid: "7",
+        in: 500,
+        out: 600,
+        sockets: [
+          expect.objectContaining({ iface: "utun3", udp: false, in: 7, out: 8 }),
+          expect.objectContaining({ iface: "en0", udp: true, remotePort: 51820, in: 9, out: 10 }),
+        ],
+      },
+    ],
+  ]);
+});
+
 test("same-name bundle rules are independent and old settings retain their meaning", () => {
   const first = "/Applications/Example.app";
   const second = "/Somewhere/Example.app";
@@ -140,6 +171,126 @@ test("a failed usage flush can be retried without losing migrated rows", async (
       );
       tracker.flushDirty(save);
       expect(save).toHaveBeenCalledTimes(1);
+    } finally {
+      await tracker.stop();
+    }
+  } finally {
+    vi.unstubAllGlobals();
+  }
+});
+
+test("saved Setapp agent and translocated rows fold into one row per app", async () => {
+  vi.stubGlobal("tjs", {
+    homeDir: "/Users/test",
+    makeTempDir: async () => "/unused/tor-apps",
+    makeDir: async () => {},
+    writeFile: async () => {},
+    remove: async () => {},
+    spawn: (args: string[]) => ({
+      stdout: {
+        // NSWorkspace lookup: Rex, Herdr, Setapp, OpenCode
+        text: async () =>
+          args[0] === "/usr/bin/osascript" ? "\n\n/Applications/Setapp.app\n\n" : "",
+      },
+      wait: async () => ({ exit_status: 0 }),
+    }),
+  });
+  try {
+    const { createAppTracker } = await import("../backend/apps");
+    const day = "2026-11-20";
+    const agent = "/Users/test/Library/Application Support/Setapp/LaunchAgents/Setapp.app";
+    const copy = (id: string) =>
+      `/private/var/folders/fr/abc/T/AppTranslocation/${id}/d/Install Setapp 3.app`;
+    const tracker = await createAppTracker(
+      "/unused",
+      {
+        [day]: {
+          "/Applications/Setapp.app": {
+            name: "Setapp",
+            bundle: "/Applications/Setapp.app",
+            down: 5,
+            up: 1,
+          },
+          [agent]: { name: "Setapp", bundle: agent, down: 9, up: 2 },
+          [copy("A")]: { name: "Install Setapp 3", bundle: copy("A"), down: 4, up: 0 },
+          [copy("B")]: { name: "Install Setapp 3", bundle: copy("B"), down: 3, up: 0 },
+        },
+      },
+      { paused: true, iconDir: "/unused" },
+    );
+    try {
+      const save = vi.fn();
+      tracker.flushDirty(save);
+      const [rows, , removed] = save.mock.calls[0];
+      expect(rows).toEqual(
+        expect.arrayContaining([
+          { day, app: "Setapp", bundle: "/Applications/Setapp.app", down: 14, up: 3 },
+          { day, app: "Install Setapp 3", bundle: "", down: 7, up: 0 },
+        ]),
+      );
+      expect(rows).toHaveLength(2);
+      expect(removed).toEqual(
+        expect.arrayContaining([
+          { day, app: "Setapp", bundle: agent },
+          { day, app: "Install Setapp 3", bundle: copy("A") },
+          { day, app: "Install Setapp 3", bundle: copy("B") },
+        ]),
+      );
+    } finally {
+      await tracker.stop();
+    }
+  } finally {
+    vi.unstubAllGlobals();
+  }
+});
+test("connections show recent per-app traffic as active, then return to idle", async () => {
+  const frame = new TextEncoder().encode(
+    [
+      ",interface,bytes_in,bytes_out,",
+      "Example.4242,,100,200,",
+      ",interface,bytes_in,bytes_out,",
+      "Example.4242,,140,260,",
+      ",interface,bytes_in,bytes_out,",
+    ].join("\r\n") + "\r\n",
+  );
+  vi.stubGlobal("tjs", {
+    homeDir: "/Users/test",
+    makeTempDir: async () => "/unused/tor-apps",
+    makeDir: async () => {},
+    writeFile: async () => {},
+    remove: async () => {},
+    spawn: (args: string[]) => {
+      if (args[0] === "/usr/bin/script") {
+        let streamController: ReadableStreamDefaultController<Uint8Array> | undefined;
+        return {
+          stdout: new ReadableStream<Uint8Array>({
+            start(controller) {
+              streamController = controller;
+              controller.enqueue(frame);
+            },
+          }),
+          kill: () => streamController?.close(),
+        };
+      }
+      return {
+        stdout: { text: async () => (args[0] === "/bin/ps" ? "4242 1\n" : "") },
+        wait: async () => ({ exit_status: 0 }),
+      };
+    },
+  });
+  try {
+    const { createAppTracker } = await import("../backend/apps");
+    const tracker = await createAppTracker("/unused", {}, { iconDir: "/unused" });
+    try {
+      await vi.waitFor(() =>
+        expect(tracker.top(5)[0]).toMatchObject({
+          name: "System & CLI",
+          down: 40,
+          up: 60,
+          active: true,
+        }),
+      );
+      await vi.waitFor(() => expect(tracker.top(5)[0]?.active).toBe(false), { timeout: 4_000 });
     } finally {
       await tracker.stop();
     }
