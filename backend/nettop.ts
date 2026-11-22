@@ -12,6 +12,8 @@ export interface ProcSample {
   }[];
 }
 
+const TCP_SOCKET = /^tcp\d?\s/;
+
 /** One parser per child process: a replaced child can never touch its successor's frame. */
 export function createNettopParser(onSample: (sample: ProcSample[]) => void) {
   const decoder = new TextDecoder();
@@ -24,6 +26,9 @@ export function createNettopParser(onSample: (sample: ProcSample[]) => void) {
     buf = lines.pop() ?? "";
     for (const raw of lines) {
       const line = raw.replace(/\r$/, "");
+      // Only tunnel sockets and UDP sockets (a VPN carrier candidate) are used, see
+      // endSample: with hundreds of TCP flows, dropping the rest first keeps socket mode cheap
+      if (TCP_SOCKET.test(line) && !line.includes(",utun")) continue;
       if (line.startsWith(",interface,bytes_in,bytes_out,")) {
         const complete = sample;
         sample = [];

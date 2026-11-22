@@ -35,7 +35,7 @@ Tor keeps itself up to date: when it starts, and then daily, weekly or monthly a
 - **Live speed in the menu bar.** The icon shows your current speed, updated every second. Choose what it shows in **Settings › Menubar**: the volume bars, arrows, the Tor logo or nothing, next to the download speed, the upload speed, both, today's total downloaded or uploaded, or the net total.
 - **A live chart.** The panel plots the last five minutes of upload and download, with the current speeds above it.
 - **Today at a glance.** See how much you have downloaded and uploaded since midnight.
-- **Top apps.** See which apps use the most data today, over the last 7 days or over the last 30, with each app's icon. Choose whether the list shows 5, 10 or 20 apps in **Settings › General**. Hover an app and click the eye to hide it from the list and the totals; hidden apps are listed in **Settings › Ignored apps**, where you can bring them back.
+- **Connections.** See which apps use the most data today, over the last 7 days or over the last 30, with each app's icon and a live activity indicator. Choose whether the list shows 5, 10 or 20 apps in **Settings › General**. Hover an app and click the eye to hide it from the list and the totals; hidden apps are listed in **Settings › Ignored apps**, where you can bring them back.
 - **Stats.** A chart of the last 7, 30 or 90 days, with your most data-hungry app, totals, your busiest day and your daily average.
 - **Your units, your colors.** Show speeds in MB/s or Mbps, pick a light, dark or system theme, and choose the download and upload colors from a set of presets.
 - **Private by design.** Tor reads your Mac's network counters. It doesn't capture or inspect your traffic, and it has no account or analytics. Your usage history is kept on your Mac for 90 days.
@@ -44,7 +44,7 @@ Tor keeps itself up to date: when it starts, and then daily, weekly or monthly a
 
 - **Apps are grouped under the app that started them.** Traffic from a program you run in a terminal counts toward the terminal app, and a browser's helper processes count toward the browser. OpenCode’s desktop app and shared background service appear together as one entry.
 - **Only traffic that leaves your Mac is counted.** Connections between programs on your own Mac are ignored.
-- **VPN totals are approximate.** Tor estimates which traffic belongs to the VPN itself to avoid counting it twice. If your VPN still shows up in Top apps, you can hide it.
+- **VPN totals are approximate.** Tor estimates which traffic belongs to the VPN itself to avoid counting it twice. If your VPN still shows up in Connections, you can hide it.
 - **Tor is a usage monitor, not a security monitor.** macOS process attribution is best-effort; Tor isn't designed to detect or account for every process on a compromised Mac.
 - **History starts when you first open Tor.** Longer ranges fill up over time, up to 90 days.
 - **Totals and the app list only count while Tor is running.**
@@ -56,13 +56,13 @@ Tor uses [the same macOS draft, verification, and local signing process as Teneo
 ## Screenshots
 
 <p align="center">
-  <img src="screenshots/live-panel.png" alt="Tor's panel: the current upload and download speed above a live chart of the last five minutes, today's downloaded and uploaded totals, and the start of the top apps list" width="320">
+  <img src="screenshots/live-panel.png" alt="Tor's panel: the current upload and download speed above a live chart of the last five minutes, today's downloaded and uploaded totals, and the start of the Connections list" width="320">
   <br>
   <em>Live speed, a five-minute chart and today's totals</em>
 </p>
 
 <p align="center">
-  <img src="screenshots/top-apps.png" alt="Tor's Top apps list with Today, 7d and 30d tabs, showing each app's icon and how much data it used" width="400">
+  <img src="screenshots/top-apps.png" alt="Tor's Connections list with Today, 7d and 30d tabs, showing each app's icon and how much data it used" width="400">
   <br>
   <em>The apps using the most data, today, this week or this month</em>
 </p>

@@ -145,17 +145,17 @@ function watchDownloads(onProgress: (progress: UpdateProgress) => void): () => v
 
 let installing = false;
 
-/** download the update and relaunch into it */
+/** download the update and relaunch into it; false when an install is already running */
 export async function installUpdate(
   app: TinyApp,
   onProgress: (progress: UpdateProgress) => void,
-): Promise<void> {
-  if (installing) return;
+): Promise<boolean> {
+  if (installing) return false;
   if (status.state !== "available") throw new Error("No update is available");
   installing = true;
   const unwatch = watchDownloads(onProgress);
   try {
-    await app.update.install();
+    return await app.update.install();
   } finally {
     unwatch();
     installing = false;

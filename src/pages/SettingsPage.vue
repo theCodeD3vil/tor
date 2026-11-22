@@ -162,7 +162,7 @@ const valueOptions: { value: MenubarValue; label: string }[] = [
       </SettingsField>
 
       <SettingsField>
-        <template #label>Top apps</template>
+        <template #label>Connections</template>
         <Select v-model="topApps">
           <SelectTrigger size="sm" class="w-20">
             <SelectValue />

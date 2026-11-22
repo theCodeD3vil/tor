@@ -65,7 +65,8 @@ jobs:
         with:
           bun-version: 1.4.4
 
-      - run: bun install --frozen-lockfile
+      # no install scripts: this job later holds the signing certificate and a write token
+      - run: bun install --frozen-lockfile --ignore-scripts
 
       - name: Check and test
         run: |

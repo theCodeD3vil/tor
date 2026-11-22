@@ -249,7 +249,7 @@ onUnmounted(() => {
 
           <div class="flex flex-col gap-3">
             <div class="flex items-center justify-between">
-              <p class="text-xs font-medium text-muted-foreground">Top apps</p>
+              <p class="text-xs font-medium text-muted-foreground">Connections</p>
               <Tabs :model-value="traffic.period" @update:model-value="setPeriod">
                 <TabsList class="h-6 px-1.5 py-0.5">
                   <TabsTrigger
@@ -286,16 +286,32 @@ onUnmounted(() => {
               <p v-else-if="!apps.length" class="py-2 text-xs text-muted-foreground">
                 {{ traffic.period === "today" ? "Collecting usage…" : "No usage recorded yet" }}
               </p>
-              <TransitionGroup v-else tag="ul" name="app" class="relative flex flex-col gap-3.5">
+              <TransitionGroup v-else tag="ul" name="app" class="relative flex flex-col gap-4">
                 <li
                   v-for="app in apps"
                   :key="app.bundle || app.name"
                   class="app-row group flex items-center gap-2.5"
                 >
                   <AppIcon :name="app.name" :src="app.icon" class="size-8 rounded-lg" />
-                  <div class="flex min-w-0 flex-1 flex-col gap-1">
+                  <div class="flex min-w-0 flex-1 flex-col gap-2">
                     <div class="flex items-baseline justify-between gap-2 text-xs">
-                      <span class="min-w-0 truncate font-medium">{{ app.name }}</span>
+                      <span class="flex min-w-0 flex-1 items-center gap-1.5">
+                        <span class="min-w-0 truncate font-medium">{{ app.name }}</span>
+                        <span
+                          v-if="traffic.period === 'today'"
+                          class="connection-indicator size-1.5 shrink-0 rounded-full"
+                          :class="{ 'connection-indicator-active': app.active }"
+                          role="img"
+                          :aria-label="
+                            app.active
+                              ? `${app.name}: active network transfer`
+                              : `${app.name}: no recent network transfer`
+                          "
+                          :title="
+                            app.active ? 'Uploading or downloading' : 'No recent network transfer'
+                          "
+                        />
+                      </span>
                       <span
                         class="flex shrink-0 items-center gap-1 text-muted-foreground tabular-nums"
                       >
@@ -303,7 +319,7 @@ onUnmounted(() => {
                           type="button"
                           class="rounded p-0.5 opacity-0 transition-opacity hover:text-foreground focus-visible:opacity-100 group-hover:opacity-100"
                           :aria-label="`Hide ${app.name}`"
-                          :title="`Hide ${app.name} from Top apps and totals`"
+                          :title="`Hide ${app.name} from Connections and totals`"
                           @click="hideApp(app.name, app.bundle)"
                         >
                           <IconEyeOff class="size-3.5" />
@@ -526,6 +542,18 @@ body {
   overscroll-behavior: none;
 }
 
+.connection-indicator {
+  background-color: color-mix(in oklab, var(--muted-foreground) 55%, transparent);
+  transition:
+    background-color 180ms ease,
+    box-shadow 180ms ease;
+}
+
+.connection-indicator-active {
+  background-color: var(--connection-active);
+  box-shadow: 0 0 8px 1px color-mix(in oklab, var(--connection-active) 80%, transparent);
+}
+
 .no-scrollbar {
   scrollbar-width: none;
 }
@@ -584,7 +612,7 @@ body {
   transform: translateX(-100%);
 }
 
-/* top apps: rows glide to their new rank, new ones fade in, dropped ones fade out */
+/* connections: rows glide to their new rank, new ones fade in, dropped ones fade out */
 .app-move,
 .app-enter-active,
 .app-leave-active {

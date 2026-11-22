@@ -45,7 +45,7 @@ export interface Settings {
   /** look for updates on a schedule; off = only when asked */
   autoUpdates: boolean;
   updateFrequency: UpdateFrequency;
-  /** Apps left out of Top apps and the totals; still recorded. */
+  /** Apps left out of Connections and the totals; still recorded. */
   ignoredApps: IgnoredApp[];
 }
 
@@ -91,6 +91,10 @@ export function pickSettings(input: unknown): Partial<Settings> {
   return picked as Partial<Settings>;
 }
 
+/** an absolute path to an .app bundle, the only kind of path an icon is rendered from */
+export const isBundlePath = (path: string): boolean =>
+  path.length <= 4096 && path.startsWith("/") && path.endsWith(".app") && !path.includes("\0");
+
 function pickIgnoredApps(input: unknown[], bundles: unknown): IgnoredApp[] {
   const picked = new Map<string, IgnoredApp>();
   const old = bundles && typeof bundles === "object" ? (bundles as Record<string, unknown>) : {};
@@ -103,8 +107,7 @@ function pickIgnoredApps(input: unknown[], bundles: unknown): IgnoredApp[] {
     if (!raw || typeof raw !== "object") continue;
     const { name, bundle, legacyName } = raw as Record<string, unknown>;
     if (typeof name !== "string" || !name || name.length > 200) continue;
-    if (typeof bundle !== "string" || (bundle && !bundle.startsWith("/")) || bundle.length > 4096)
-      continue;
+    if (typeof bundle !== "string" || (bundle && !isBundlePath(bundle))) continue;
     const app: IgnoredApp = { name: !bundle && name === "opencode" ? "OpenCode" : name, bundle };
     if (!bundle && legacyName === true) app.legacyName = true;
     picked.set(appId(app), app);

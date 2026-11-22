@@ -43,8 +43,12 @@ function readSysctl(): CounterReading | null {
   const size = new BigUint64Array(1);
   const lenBuf = new Uint8Array(size.buffer);
   if (sysctl(mib, 6, null, lenBuf, null, 0) !== 0) return null;
-  const len = Number(size[0]);
-  if (!len || len > 8_000_000) return null;
+  const needed = Number(size[0]);
+  if (!needed || needed > 8_000_000) return null;
+  // room for an interface that appears between the two calls: without it the read
+  // fails, the netstat fallback answers, and the change of source drops two ticks
+  const len = needed + Math.max(4096, needed >> 2);
+  size[0] = BigInt(len);
   const out = new Uint8Array(len);
   if (sysctl(mib, 6, out, lenBuf, null, 0) !== 0 || size[0] > BigInt(len)) return null;
   return parseRoutingMessages(out.subarray(0, Number(size[0])));
